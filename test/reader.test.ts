@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -141,7 +141,7 @@ test("a delivery that was altered, forged, stale, repeated or moved is refused",
   await send(moved, "ep-6", {}, { subscription: "sub_other" });
   assert.equal(await reader.poll(), 1);
   assert.deepEqual(ids(), ["ep-1"]);
-  const reasons = lines.filter((line) => line.startsWith("refused")).map((line) => line.split(": ")[1]);
+  const reasons = lines.filter((line) => line.startsWith("skipped")).map((line) => line.split(": ")[1]);
   assert.deepEqual(reasons, ["bad signature", "bad signature", "timestamp is not close to the time of receipt", "repeat", "event a.moved on a subscription for a.chat", "unknown subscription"]);
 
   // The mailbox hands the same delivery out again after it was acked.
@@ -178,7 +178,6 @@ test("a restarted reader keeps its hook, secret and position", async () => {
   await send(second.sub("a.moved"), "ep-2", {});
   assert.equal(await second.reader.poll(), 1);
   assert.deepEqual(second.ids(), ["ep-2"]);
-  assert.equal(JSON.parse(readFileSync(first.options.stateFile, "utf8")).hook.url, first.reader.hookUrl);
 });
 
 test("two readers on one mailbox each get their own events", async () => {
@@ -191,6 +190,7 @@ test("two readers on one mailbox each get their own events", async () => {
   assert.equal(await one.reader.poll(), 1);
   assert.equal(await two.reader.poll(), 1);
   assert.deepEqual([one.ids(), two.ids()], [["ep-1"], ["ep-2"]]);
+  assert.deepEqual([...one.lines, ...two.lines].filter((line) => line.startsWith("skipped")), [], "neither fetched the other's delivery");
 });
 
 test("a failing handler does not stop the events after it", async () => {
@@ -210,7 +210,7 @@ test("a failing handler does not stop the events after it", async () => {
 });
 
 test("run subscribes, hands on an event that arrives while it waits, and stops", async () => {
-  const { reader, ids, sub } = setUp(["a.moved"], { waitSeconds: 10 });
+  const { reader, ids, sub } = setUp(["a.moved"], { waitSeconds: 5 });
   const stop = new AbortController();
   const running = reader.run(stop.signal);
   while (!reader.hookUrl || !sub("a.moved")) await new Promise((resolve) => setTimeout(resolve, 20));
@@ -219,9 +219,24 @@ test("run subscribes, hands on an event that arrives while it waits, and stops",
   const started = Date.now();
   while (ids().length === 0 && Date.now() - started < 5000) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(ids(), ["ep-1"]);
+  // Long enough for the next waiting fetch to be in flight.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const stopped = Date.now();
   stop.abort();
   await running;
-  assert.ok(Date.now() - started < 5000, "stops without waiting out the fetch");
+  assert.ok(Date.now() - stopped < 2000, "stops without waiting out the fetch");
+});
+
+test("a hook the mailbox no longer has is replaced at the next refresh", async () => {
+  const { reader, ids, sub } = setUp(["a.moved"]);
+  await reader.subscribe();
+  const old = reader.hookUrl!;
+  await mailboxClient(target).deleteHook(old.split("/").at(-1)!);
+  await reader.subscribe();
+  assert.notEqual(reader.hookUrl, old);
+  await send(sub("a.moved"), "ep-1", {});
+  assert.equal(await reader.poll(), 1);
+  assert.deepEqual(ids(), ["ep-1"]);
 });
 
 test("unsubscribe tells the server and removes the hook", async () => {

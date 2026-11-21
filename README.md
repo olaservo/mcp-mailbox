@@ -56,9 +56,15 @@ node --env-file=<file> src/reader/cli.ts unsubscribe  # unsubscribe and remove t
 What it does:
 
 - Creates one hook in the mailbox and a `whsec_` secret on first run, and keeps both in the state file.
-- Sends `events/subscribe` for each event as a single 2026-07-28 request with no session, and again every 5 minutes. The repeat is the refresh, and it restores a subscription the server lost in a restart.
+- Sends `events/subscribe` for each event as a single 2026-07-28 request with no session. It repeats this every 5 minutes, or at half the granted lifetime when that is sooner. The repeat is the refresh, and it restores a subscription the server lost in a restart.
 - Fetches with `wait=25` and `hook=<its token>`, so several readers can share one mailbox. After a fetch returns deliveries it fetches again 500 ms later, so events POSTed together are ordered together.
-- Refuses a delivery whose signature does not verify, whose timestamp is more than 5 minutes from `receivedAt`, whose `receivedAt` is over 8 days old or in the future, whose subscription id it does not hold, whose event name is not the subscription's, or that it has handled before. The subscription id header is not signed and the event name is, which is the reason for the name check.
+- Skips a delivery, with a log line, when:
+  - the signature does not verify;
+  - the timestamp is more than 5 minutes from `receivedAt`;
+  - `receivedAt` is over 8 days old or in the future;
+  - it does not hold the subscription id;
+  - the event name is not the subscription's (the subscription id header is not signed, the name is);
+  - it has handled the delivery before.
 - Orders a batch by the number at the end of `eventId` when the ids share a prefix, otherwise by `timestamp`, then by arrival.
 - Hands events on one at a time, saves its position, then acks. A reader stopped between handing on and saving hands the batch on again at the next start.
 
@@ -108,10 +114,10 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 
 Reader, 2026-11-21, with forge-mcp-server checked out at `c2fa1e4` and its `dist` as built that day:
 
-- 9 reader tests pass against the in-memory mailbox and against the Worker under `wrangler dev`, with a stand-in MCP server.
+- The reader tests pass against the in-memory mailbox and against the Worker under `wrangler dev`, with a stand-in MCP server.
 - With `FORGE_MCP_SERVER` set, the reader subscribes to forge-mcp-server's HTTP endpoint with a bearer token, and four events emitted in order are handed on in order. Passes in memory, under `wrangler dev` and against the deployed Worker.
 - The CLI was run once against the in-memory mailbox and forge-mcp-server, printing events and with `READER_EXEC`.
-- After the Worker was deployed with `hook` on `/deliveries` and `/ack` (version `ba05efcf`), all 20 tests that apply pass against it, including two readers on one mailbox.
+- After the Worker was deployed with `hook` on `/deliveries` and `/ack` (version `ba05efcf`), every test that applies passes against it, including two readers on one mailbox.
 
 Not tested: a real game through the mailbox, a reader left running for hours, and what a held `wait` request costs in Durable Object duration.
 

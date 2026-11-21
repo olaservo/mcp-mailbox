@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { handle } from "../src/core.ts";
 import { MemoryStore } from "../src/memory.ts";
+import type { Fetched } from "../src/reader/verify.ts";
 
 export interface Target {
   base: string;
@@ -44,13 +45,7 @@ export async function startMailbox(opts: { maxStored?: number } = {}): Promise<T
   };
 }
 
-export interface Fetched {
-  seq: number;
-  hook: string;
-  receivedAt: number;
-  headers: Record<string, string>;
-  body: string;
-}
+export type { Fetched };
 
 /** The reader's side of the mailbox API. */
 export function reader(target: Target) {

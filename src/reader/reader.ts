@@ -31,10 +31,6 @@ export interface ReaderOptions {
   /** Called with each event, one at a time, in order. */
   handle: (received: Received) => Promise<void> | void;
   label?: string;
-  /** Subscription lifetime to ask for. */
-  ttlMs?: number;
-  /** Time between refreshes. A refresh also restores a subscription the server lost in a restart. */
-  refreshMs?: number;
   /** How long one fetch waits at the mailbox, up to 25. */
   waitSeconds?: number;
   /** After a fetch returns deliveries, fetch again after this long, so events sent together are ordered together. */
@@ -48,13 +44,17 @@ interface State {
   hook?: { token: string; url: string };
   /** The highest mailbox sequence number handled. */
   after: number;
-  /** Event name to the subscription the server granted. */
-  subscriptions: Record<string, { id: string; refreshBefore: string | null }>;
+  /** Event name to the id of the subscription the server granted. */
+  subscriptions: Record<string, string>;
   /** `<subscription id> <webhook-id>` of handled deliveries, with the time of receipt. */
   seen: Record<string, number>;
 }
 
 const PROTOCOL_VERSION = "2026-07-28";
+/** Subscription lifetime asked for. */
+const TTL_MS = 60 * 60 * 1000;
+/** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart. */
+const REFRESH_MS = 5 * 60 * 1000;
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
@@ -69,11 +69,10 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 /** Event ids that end in a number after the same prefix are ordered by it. Others by timestamp, then by arrival. */
 function inOrder(a: { received: Received; seq: number }, b: { received: Received; seq: number }): number {
-  const x = /^(.*?)(\d+)$/.exec(a.received.event.eventId);
-  const y = /^(.*?)(\d+)$/.exec(b.received.event.eventId);
-  if (x && y && x[1] === y[1] && x[2] !== y[2]) return Number(x[2]) - Number(y[2]);
-  const byTime = Date.parse(a.received.event.timestamp) - Date.parse(b.received.event.timestamp);
-  return byTime || a.seq - b.seq;
+  const x = /^(.*\D)(\d+)$/.exec(a.received.event.eventId);
+  const y = /^(.*\D)(\d+)$/.exec(b.received.event.eventId);
+  if (x && y && x[1] === y[1]) return Number(x[2]) - Number(y[2]) || a.seq - b.seq;
+  return Date.parse(a.received.event.timestamp) - Date.parse(b.received.event.timestamp) || a.seq - b.seq;
 }
 
 /**
@@ -101,24 +100,26 @@ export class Reader {
     return this.state.hook?.url;
   }
 
-  /** Subscribes or refreshes every event. Creates the hook first when the mailbox does not have it. */
-  async subscribe(): Promise<void> {
+  /** Subscribes or refreshes every event. Creates the hook first when the mailbox does not have it. Returns when the first subscription lapses. */
+  async subscribe(): Promise<number> {
     const hook = await this.ensureHook();
+    let lapses = Infinity;
     for (const name of this.opts.events) {
       const result = (await this.rpc("events/subscribe", {
         name,
         arguments: {},
         delivery: { mode: "webhook", url: hook.url, secret: this.state.secret },
-        ttlMs: this.opts.ttlMs ?? 60 * 60 * 1000,
+        ttlMs: TTL_MS,
         cursor: null,
       })) as { id: string; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
-      const known = this.state.subscriptions[name]?.id === result.id;
-      this.state.subscriptions[name] = { id: result.id, refreshBefore: result.refreshBefore ?? null };
-      if (!known) this.log(`subscribed ${name} as ${result.id}`);
+      if (this.state.subscriptions[name] !== result.id) this.log(`subscribed ${name} as ${result.id}`);
+      this.state.subscriptions[name] = result.id;
+      if (result.refreshBefore) lapses = Math.min(lapses, Date.parse(result.refreshBefore));
       if (result.truncated) this.log(`${name}: the server reports a gap`);
       if (result.deliveryStatus?.lastError) this.log(`${name}: the server's last delivery failed: ${result.deliveryStatus.lastError}, failing since ${result.deliveryStatus.failedSince ?? "unknown"}`);
     }
     this.save();
+    return lapses;
   }
 
   /** Unsubscribes every event and removes the hook. */
@@ -152,52 +153,16 @@ export class Reader {
     }
 
     const now = this.now();
-    const byId = new Map(Object.entries(this.state.subscriptions).map(([name, sub]) => [sub.id, name]));
-    const accepted: { received: Received; seq: number; key: string }[] = [];
-    const keys = new Set<string>();
+    const accepted = new Map<string, { received: Received; seq: number }>();
     for (const delivery of batch) {
-      // A mailbox from before per-hook fetches returns every hook's deliveries.
-      if (delivery.hook !== hook.token) continue;
-      const subscriptionId = delivery.headers["x-mcp-subscription-id"] ?? "";
-      const webhookId = delivery.headers["webhook-id"] ?? "";
-      const key = `${subscriptionId} ${webhookId}`;
-      const refuse = (why: string) => this.log(`refused delivery ${delivery.seq} (${key}): ${why}`);
-      const why = refusal(this.state.secret, delivery, now);
-      if (why) {
-        refuse(why);
-        continue;
-      }
-      const name = byId.get(subscriptionId);
-      if (name === undefined) {
-        refuse("unknown subscription");
-        continue;
-      }
-      let event: EventBody;
-      try {
-        event = JSON.parse(Buffer.from(delivery.body, "base64").toString("utf8")) as EventBody;
-      } catch {
-        refuse("body is not JSON");
-        continue;
-      }
-      if ((event as { type?: unknown }).type !== undefined && event.eventId === undefined) {
-        this.log(`control envelope ${String((event as { type?: unknown }).type)} on ${subscriptionId}`);
-        continue;
-      }
-      // The subscription id header is not signed. The event name is, so a delivery moved to another subscription is caught.
-      if (event.name !== name) {
-        refuse(`event ${event.name} on a subscription for ${name}`);
-        continue;
-      }
-      if (this.state.seen[key] !== undefined || keys.has(key)) {
-        refuse("repeat");
-        continue;
-      }
-      keys.add(key);
-      accepted.push({ received: { subscriptionId, webhookId, receivedAt: delivery.receivedAt, event }, seq: delivery.seq, key });
+      const key = `${delivery.headers["x-mcp-subscription-id"]} ${delivery.headers["webhook-id"]}`;
+      const read = this.read(delivery, now);
+      const why = typeof read === "string" ? read : this.state.seen[key] !== undefined || accepted.has(key) ? "repeat" : undefined;
+      if (why !== undefined) this.log(`skipped delivery ${delivery.seq} (${key}): ${why}`);
+      else accepted.set(key, { received: read as Received, seq: delivery.seq });
     }
 
-    accepted.sort(inOrder);
-    for (const { received, key } of accepted) {
+    for (const [key, { received }] of [...accepted].sort((a, b) => inOrder(a[1], b[1]))) {
       try {
         await this.opts.handle(received);
       } catch (err) {
@@ -213,22 +178,21 @@ export class Reader {
     // Saved before the ack, so a stop between the two repeats nothing.
     this.save();
     await this.mailbox("POST", "/ack", { upTo: this.state.after, hook: hook.token });
-    return accepted.length;
+    return accepted.size;
   }
 
   /** Subscribes, then fetches and refreshes until `signal` aborts. A failed request is logged and tried again. */
   async run(signal: AbortSignal): Promise<void> {
     this.stopping = signal;
-    const refreshMs = this.opts.refreshMs ?? 5 * 60 * 1000;
     const refreshing = (async () => {
       while (!signal.aborted) {
-        let wait = refreshMs;
+        let wait = 15_000;
         try {
-          await this.subscribe();
+          // Half the granted lifetime, so one failed refresh leaves time for another.
+          wait = Math.max(1000, Math.min(REFRESH_MS, ((await this.subscribe()) - Date.now()) / 2));
         } catch (err) {
           if (signal.aborted) break;
           this.log(`subscribe failed: ${(err as Error).message}`);
-          wait = Math.min(refreshMs, 15_000);
         }
         await sleep(wait, signal);
       }
@@ -249,6 +213,27 @@ export class Reader {
       }
     }
     await refreshing;
+  }
+
+  /** The event in a delivery, or the reason it is not handed on. */
+  private read(delivery: Fetched, now: number): Received | string {
+    const why = refusal(this.state.secret, delivery, now);
+    if (why) return why;
+    const subscriptionId = delivery.headers["x-mcp-subscription-id"]!;
+    const name = Object.keys(this.state.subscriptions).find((n) => this.state.subscriptions[n] === subscriptionId);
+    if (name === undefined) return "unknown subscription";
+    let body: (Partial<EventBody> & { type?: unknown }) | null;
+    try {
+      body = JSON.parse(Buffer.from(delivery.body, "base64").toString("utf8")) as typeof body;
+    } catch {
+      body = null;
+    }
+    if (body === null || typeof body !== "object") return "body is not a JSON object";
+    // `gap` and `terminated`. The next refresh subscribes again after a `terminated`.
+    if (typeof body.type === "string") return `control envelope ${body.type}`;
+    // The subscription id header is not signed and the event name is.
+    if (body.name !== name) return `event ${body.name} on a subscription for ${name}`;
+    return { subscriptionId, webhookId: delivery.headers["webhook-id"]!, receivedAt: delivery.receivedAt, event: body as EventBody };
   }
 
   private async ensureHook(): Promise<{ token: string; url: string }> {

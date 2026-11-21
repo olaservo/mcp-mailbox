@@ -1,25 +1,16 @@
 import assert from "node:assert/strict";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { Reader, type Received } from "../src/reader/reader.ts";
-import { reader, startMailbox, type Fetched } from "./harness.ts";
+import { signatureOk } from "../src/reader/verify.ts";
+import { reader, startMailbox } from "./harness.ts";
 
 // Runs forge-mcp-server's WebhookHub against the mailbox. Set FORGE_MCP_SERVER to a built clone.
 const repo = process.env.FORGE_MCP_SERVER;
-
-function signatureOk(secret: string, delivery: Fetched): boolean {
-  const key = Buffer.from(secret.slice(6), "base64");
-  const signed = `${delivery.headers["webhook-id"]}.${delivery.headers["webhook-timestamp"]}.`;
-  const expected = createHmac("sha256", key).update(signed).update(Buffer.from(delivery.body, "base64")).digest();
-  return delivery.headers["webhook-signature"]!.split(" ").some((part) => {
-    const given = Buffer.from(part.replace(/^v1,/, ""), "base64");
-    return given.length === expected.length && timingSafeEqual(given, expected);
-  });
-}
 
 test("forge-mcp-server delivers through the mailbox and the reader verifies", { skip: repo ? false : "FORGE_MCP_SERVER is not set" }, async () => {
   const { WebhookHub } = await import(pathToFileURL(join(repo!, "dist/webhooks.js")).href);
@@ -95,11 +86,11 @@ test("the reader subscribes to forge-mcp-server over HTTP and hands on its event
     assert.equal(await reader.poll(5), 4);
     assert.deepEqual(got.map((r) => r.event.eventId), sent.map((e: { eventId: string }) => e.eventId));
     assert.deepEqual(got.map((r) => r.event.name), ["forge.your_move", "forge.chat", "forge.your_move", "forge.your_move"]);
-    assert.deepEqual(lines.filter((line) => line.startsWith("refused")), []);
 
-    // A refresh keeps the subscriptions and reports no failed delivery.
+    // A refresh keeps the subscriptions. Nothing was skipped and the server reports no failed delivery.
     await reader.subscribe();
     assert.equal(hub.size, 2);
+    assert.deepEqual(lines.filter((line) => !line.startsWith("subscribed")), []);
     await reader.unsubscribe();
     assert.equal(hub.size, 0);
   } finally {
