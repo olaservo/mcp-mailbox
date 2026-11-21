@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mcp-mailbox",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }]
+  // MAILBOX_KEY is a secret: `npx wrangler secret put MAILBOX_KEY`. For `wrangler dev` it comes from .dev.vars.
+}
