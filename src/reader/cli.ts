@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { PollEndpoint } from "./poll-endpoint.ts";
 import { Reader, type Received } from "./reader.ts";
 
 const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
@@ -11,6 +12,8 @@ const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
   READER_EVENTS              event names, comma separated
   READER_EXEC                a command run once per event, with the event as JSON on stdin.
                              Without it, each event is one JSON line on stdout.
+  READER_POLL_PORT           serve the events as MCP Events poll delivery on 127.0.0.1:<port>, for a client
+                             that polls. Takes the place of READER_EXEC.
   READER_STATE               state file (default ~/.mcp-mailbox/reader-state.json). It holds the signing secret.
   READER_LABEL               the hook's label in the mailbox`;
 
@@ -39,14 +42,18 @@ function exec(commandLine: string, received: Received): Promise<void> {
   });
 }
 
+const events = env.READER_EVENTS!.split(",").map((name) => name.trim()).filter(Boolean);
+const endpoint = env.READER_POLL_PORT ? new PollEndpoint(events) : undefined;
+
 const reader = new Reader({
   mailbox: { url: env.MAILBOX_URL!, key: env.MAILBOX_KEY! },
   server: { url: env.READER_SERVER_URL!, token: env.READER_SERVER_TOKEN },
-  events: env.READER_EVENTS!.split(",").map((name) => name.trim()).filter(Boolean),
+  events,
   stateFile: env.READER_STATE ?? join(homedir(), ".mcp-mailbox", "reader-state.json"),
   label: env.READER_LABEL,
   log,
   handle: (received) => {
+    if (endpoint) return endpoint.add(received.event);
     if (env.READER_EXEC) return exec(env.READER_EXEC, received);
     console.log(JSON.stringify(received));
   },
@@ -58,6 +65,7 @@ if (command === "unsubscribe") {
 } else {
   const stop = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => stop.abort());
+  if (endpoint) log(`serving events/poll on http://127.0.0.1:${(await endpoint.listen(Number(env.READER_POLL_PORT))).port}`);
   log(`reading ${env.MAILBOX_URL} for ${env.READER_EVENTS} from ${env.READER_SERVER_URL}`);
   await reader.run(stop.signal);
 }

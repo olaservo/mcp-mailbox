@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { PollEndpoint } from "../src/reader/poll-endpoint.ts";
 import { Reader, type Received, type ReaderOptions } from "../src/reader/reader.ts";
 import { reader as mailboxClient, startMailbox, type Target } from "./harness.ts";
 
@@ -247,4 +248,50 @@ test("unsubscribe tells the server and removes the hook", async () => {
   assert.ok(server.unsubscribed.includes("a.gone"));
   assert.equal(reader.hookUrl, undefined);
   assert.equal((await fetch(url, { method: "POST", body: "{}" })).status, 404);
+});
+
+test("a polling client gets the reader's events from the poll endpoint", async () => {
+  const endpoint = new PollEndpoint(["a.moved", "a.chat"]);
+  const { reader, sub } = setUp(["a.moved", "a.chat"], { handle: ({ event }) => endpoint.add(event) });
+  const served = await endpoint.listen(0);
+  // The request the mcp-events mod sends.
+  const rpc = async (method: string, params: object, headers: Record<string, string> = {}) => {
+    const res = await fetch(`http://127.0.0.1:${served.port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-method": method, ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    return { status: res.status, ...((await res.json()) as { result?: any; error?: { code: number } }) };
+  };
+  const poll = async (name: string, cursor: string | null, extra: object = {}) => (await rpc("events/poll", { name, arguments: {}, cursor, ...extra })).result;
+  try {
+    await reader.subscribe();
+    assert.deepEqual((await rpc("events/list", {})).result.events, [{ name: "a.moved", delivery: ["poll"] }, { name: "a.chat", delivery: ["poll"] }]);
+
+    await send(sub("a.moved"), "ep-1", { before: true });
+    await reader.poll();
+    const start = await poll("a.moved", null);
+    assert.deepEqual([start.events, start.truncated], [[], false], "no cursor starts from now");
+
+    await send(sub("a.moved"), "ep-3", { n: 3 });
+    await send(sub("a.chat"), "ep-4", { n: 4 });
+    await send(sub("a.moved"), "ep-2", { n: 2 });
+    await reader.poll();
+    const one = await poll("a.moved", start.cursor, { maxEvents: 1 });
+    assert.deepEqual([one.events.map((e: { eventId: string }) => e.eventId), one.hasMore], [["ep-2"], true]);
+    const two = await poll("a.moved", one.cursor);
+    assert.deepEqual(two.events, [{ eventId: "ep-3", name: "a.moved", timestamp: two.events[0].timestamp, data: { n: 3 } }]);
+    assert.deepEqual((await poll("a.moved", two.cursor)).events, []);
+    assert.deepEqual((await poll("a.chat", start.cursor)).events.map((e: { eventId: string }) => e.eventId), ["ep-4"]);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const aged = await poll("a.moved", start.cursor, { maxAgeMs: 10 });
+    assert.deepEqual([aged.events, aged.truncated], [[], true], "events older than maxAgeMs are reported as a gap");
+    assert.equal((await poll("a.moved", "00000000:1")).truncated, true, "a cursor from another run");
+    assert.equal((await rpc("events/poll", { name: "a.other", cursor: null })).error?.code, -32602);
+    assert.equal((await rpc("events/subscribe", { name: "a.moved" })).error?.code, -32601);
+    assert.equal((await rpc("events/list", {}, { origin: "https://example.com" })).status, 403);
+  } finally {
+    await served.close();
+  }
 });
