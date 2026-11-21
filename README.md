@@ -2,29 +2,74 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: not built. The repo holds one spike.
+Status: the mailbox is built and tested locally. It is not deployed. The reader and the encryption experiment are not started.
 
-## Plan
+## Parts
 
-- Mailbox: a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. Target: a Cloudflare Worker.
-- Reader: a daemon that subscribes with the mailbox URL as the callback, fetches, verifies, deduplicates and hands events to an agent.
-- Experiment: the server encrypts the payload to a key the client supplies, so the mailbox cannot read events.
+- Mailbox (built): a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. It runs as a Cloudflare Worker with one SQLite Durable Object. `src/core.ts` holds the HTTP surface and does not depend on Workers.
+- Reader (not started): a daemon that subscribes with a mailbox URL as the callback, fetches, verifies, deduplicates and hands events to an agent.
+- Encryption (not started): the server encrypts the payload to a key the client supplies, so the mailbox cannot read events.
 
-## Spike
+## What the mailbox can and cannot do
 
-`spike/mailbox-spike.mjs` runs a throwaway mailbox with no secret against the real `WebhookHub` from [forge-mcp-server](https://github.com/olaservo/forge-mcp-server), on loopback with the server's `insecure` option.
+It has no signing secret, so it cannot forge or alter a delivery without the reader's verification failing. It can read events, drop them, and hand an old one out again. The reader therefore has to:
+
+- verify `webhook-signature` over the stored bytes with its own secret;
+- check `webhook-timestamp` against the delivery's `receivedAt`, since a held delivery is older than 5 minutes by the reader's clock;
+- deduplicate on `x-mcp-subscription-id` plus `webhook-id`.
+
+A server that does not replay over webhook loses any event it emits while the mailbox is down past its retries.
+
+## API
+
+Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
+
+| Route | Who | What |
+|---|---|---|
+| `POST /hooks` with optional `{"label"}` | reader | Creates a callback path. Returns `{token, url, label}`. Use `url` as `delivery.url` in `events/subscribe`. |
+| `GET /hooks` | reader | Lists callback paths. |
+| `DELETE /hooks/<token>` | reader | Removes a path. Later POSTs to it get 404. |
+| `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held. |
+| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `wait` (up to 25) holds the request until one arrives. |
+| `POST /ack` with `{"upTo": <seq>}` | reader | Deletes deliveries up to `seq`. |
+
+Deliveries not acked are dropped after 7 days.
+
+## Develop
+
+Node 24 or later. The tests run TypeScript directly with `node --test`.
 
 ```bash
-node spike/mailbox-spike.mjs <path to a built forge-mcp-server>
+npm install
+npm test
+npm run typecheck
 ```
 
-Observed on 2026-11-21 against the `events-push` branch at `692526b`, 14 of 14 checks passed:
+`npm test` starts an in-memory mailbox. To run the same tests against the Worker, copy `.dev.vars.example` to `.dev.vars`, set a key, run `npx wrangler dev --port 8917`, and then:
 
-- A mailbox with no secret passes the server's verification handshake. A path the client did not register is refused at subscribe.
-- Deliveries held as raw bytes and headers verify later with the client's secret.
-- A body altered by the mailbox fails verification. A delivery invented by the mailbox fails verification.
-- A delivery fetched 10 minutes late fails the 5 minute freshness check against the client's clock and passes against the mailbox's `receivedAt`.
-- The mailbox can hand out an old delivery again and it passes signature and freshness. The client has to deduplicate on subscription id and `webhook-id`.
-- An event emitted while the mailbox was down past the server's retries was never delivered, and the next successful delivery cleared `lastError`.
+```bash
+MAILBOX_URL=http://127.0.0.1:8917 MAILBOX_KEY=<the key> npm test
+```
 
-Not tested: a public `https` mailbox, how the reader authenticates to the server, encryption, and a mailbox that drops deliveries.
+`FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs that server's `WebhookHub` through the mailbox.
+
+## Deploy
+
+```bash
+npx wrangler deploy
+npx wrangler secret put MAILBOX_KEY
+```
+
+The key is at least 32 characters. Reader routes answer 503 without it.
+
+## Tested
+
+2026-11-21, with forge-mcp-server's `events-push` branch at `692526b`:
+
+- 10 of 10 tests pass against the in-memory mailbox.
+- 9 pass against the Worker under `wrangler dev` (workerd, SQLite Durable Object). The tenth sets a storage limit and only runs in memory.
+- In both, forge-mcp-server's hub passes its verification handshake against the mailbox, and four deliveries from two subscriptions verify with the reader's secret.
+
+Not tested: a deployed mailbox on public `https`, a server with its `insecure` option off, and what a held `wait` request costs in Durable Object duration.
+
+`spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written. It also shows the cases a reader has to handle: a mailbox that alters, invents or repeats a delivery, and a mailbox that is down.
