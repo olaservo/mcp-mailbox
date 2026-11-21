@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": ["src/core.ts", "src/memory.ts", "test/**/*.ts"]
+  "include": ["src/core.ts", "src/memory.ts", "src/reader/*.ts", "test/**/*.ts"]
 }

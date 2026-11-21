@@ -115,3 +115,19 @@ test("a full mailbox answers 503 until the reader acks", async (t) => {
     await small.close();
   }
 });
+
+test("fetch and ack can be limited to one hook", async () => {
+  const one = await mailbox.createHook("one");
+  const two = await mailbox.createHook("two");
+  const tip = await mailbox.tip();
+  await post(one.url, "a");
+  await post(two.url, "b");
+  await post(one.url, "c");
+  const mine = await mailbox.deliveries(tip, `&hook=${one.token}`);
+  assert.deepEqual(mine.map((d) => Buffer.from(d.body, "base64").toString()), ["a", "c"]);
+  assert.equal(await mailbox.ack(mine.at(-1)!.seq, one.token), 2);
+  const left = await mailbox.deliveries(tip);
+  assert.deepEqual(left.map((d) => d.hook), [two.token]);
+  assert.equal((await fetch(`${target.base}/deliveries?hook=short`, { headers: { authorization: `Bearer ${target.key}` } })).status, 400);
+  await mailbox.ack(left[0]!.seq);
+});

@@ -1,0 +1,235 @@
+import assert from "node:assert/strict";
+import { createHmac, randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
+import { Reader, type Received, type ReaderOptions } from "../src/reader/reader.ts";
+import { reader as mailboxClient, startMailbox, type Target } from "./harness.ts";
+
+let target: Target;
+let server: Awaited<ReturnType<typeof fakeServer>>;
+
+before(async () => {
+  target = await startMailbox();
+  server = await fakeServer();
+});
+after(async () => {
+  await server.close();
+  await target.close();
+});
+
+interface Subscribed {
+  id: string;
+  name: string;
+  url: string;
+  secret: string;
+  headers: Record<string, string | string[] | undefined>;
+}
+
+/** Stands in for an MCP server: answers `events/subscribe` after a challenge to the callback, and records the request. */
+async function fakeServer() {
+  const subscribed: Subscribed[] = [];
+  const unsubscribed: string[] = [];
+  const http = createServer((req, res) => {
+    let text = "";
+    req.on("data", (chunk) => (text += chunk));
+    req.on("end", async () => {
+      const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; delivery: { url: string; secret: string } } };
+      const reply = (body: object) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
+      if (method === "events/unsubscribe") {
+        unsubscribed.push(params.name);
+        return reply({ result: {} });
+      }
+      const challenge = randomBytes(12).toString("hex");
+      const echoed = await fetch(params.delivery.url, { method: "POST", body: JSON.stringify({ type: "verification", challenge }) });
+      if (((await echoed.json().catch(() => ({}))) as { challenge?: string }).challenge !== challenge) {
+        return reply({ error: { code: -32027, message: "CallbackEndpointError" } });
+      }
+      const sub = { id: `sub_${params.name}`, name: params.name, url: params.delivery.url, secret: params.delivery.secret, headers: req.headers };
+      subscribed.push(sub);
+      reply({ result: { id: sub.id, refreshBefore: new Date(Date.now() + 3600_000).toISOString(), cursor: null, truncated: false } });
+    });
+  });
+  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`,
+    subscribed,
+    unsubscribed,
+    close: () => new Promise<void>((resolve) => { http.closeAllConnections(); http.close(() => resolve()); }),
+  };
+}
+
+interface Send {
+  secret?: string;
+  /** Seconds since the epoch in `webhook-timestamp`. */
+  timestamp?: number;
+  subscription?: string;
+  /** Changes the body after signing. */
+  alter?: (body: string) => string;
+}
+
+/** POSTs a signed event to the subscription's callback, as the server would. */
+async function send(sub: Subscribed, eventId: string, data: unknown, opts: Send = {}): Promise<void> {
+  const body = JSON.stringify({ eventId, name: sub.name, timestamp: new Date().toISOString(), data, cursor: null });
+  const timestamp = opts.timestamp ?? Math.floor(Date.now() / 1000);
+  const key = Buffer.from((opts.secret ?? sub.secret).slice(6), "base64");
+  const signature = createHmac("sha256", key).update(`${eventId}.${timestamp}.${body}`).digest("base64");
+  const res = await fetch(sub.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "webhook-id": eventId, "webhook-timestamp": String(timestamp), "webhook-signature": `v1,${signature}`, "x-mcp-subscription-id": opts.subscription ?? sub.id },
+    body: opts.alter ? opts.alter(body) : body,
+  });
+  assert.equal(res.status, 200);
+}
+
+function setUp(events: string[], extra: Partial<ReaderOptions> = {}) {
+  const got: Received[] = [];
+  const lines: string[] = [];
+  const options: ReaderOptions = {
+    mailbox: { url: target.base, key: target.key },
+    server: { url: server.url, token: "s3cret" },
+    events,
+    stateFile: join(mkdtempSync(join(tmpdir(), "reader-")), "state.json"),
+    settleMs: 50,
+    handle: (received) => void got.push(received),
+    log: (line) => lines.push(line),
+    ...extra,
+  };
+  const sub = (name: string) => server.subscribed.findLast((s) => s.name === name && s.url === reader.hookUrl)!;
+  const reader = new Reader(options);
+  return { reader, got, lines, options, sub, ids: () => got.map((r) => r.event.eventId) };
+}
+
+test("subscribes with a mailbox hook as the callback", async () => {
+  const { reader, sub } = setUp(["a.moved"]);
+  await reader.subscribe();
+  const made = sub("a.moved");
+  assert.ok(made.url.startsWith(`${target.base}/hooks/`));
+  assert.match(made.secret, /^whsec_/);
+  assert.equal(made.headers.authorization, "Bearer s3cret");
+  assert.equal(made.headers["mcp-method"], "events/subscribe");
+  assert.equal(made.headers["mcp-name"], "a.moved");
+  assert.equal(made.headers["mcp-protocol-version"], "2026-07-28");
+});
+
+test("events that arrive out of order are handed on in order, then acked", async () => {
+  const { reader, ids, sub } = setUp(["a.moved", "a.chat"]);
+  await reader.subscribe();
+  await send(sub("a.moved"), "ep-3", { n: 3 });
+  await send(sub("a.chat"), "ep-2", { n: 2 });
+  await send(sub("a.moved"), "ep-1", { n: 1 });
+  assert.equal(await reader.poll(), 3);
+  assert.deepEqual(ids(), ["ep-1", "ep-2", "ep-3"]);
+  const token = reader.hookUrl!.split("/").at(-1)!;
+  assert.deepEqual(await mailboxClient(target).deliveries(0, `&hook=${token}`), [], "the mailbox holds nothing for the hook");
+  assert.equal(await reader.poll(), 0);
+});
+
+test("a delivery that was altered, forged, stale, repeated or moved is refused", async () => {
+  const { reader, ids, lines, sub } = setUp(["a.moved", "a.chat"]);
+  await reader.subscribe();
+  const moved = sub("a.moved");
+  await send(moved, "ep-1", { ok: true });
+  await send(moved, "ep-2", {}, { alter: (body) => body.replace("ep-2", "ep-9") });
+  await send(moved, "ep-3", {}, { secret: `whsec_${randomBytes(32).toString("base64")}` });
+  await send(moved, "ep-4", {}, { timestamp: Math.floor(Date.now() / 1000) - 600 });
+  await send(moved, "ep-1", { ok: true });
+  await send(moved, "ep-5", {}, { subscription: sub("a.chat").id });
+  await send(moved, "ep-6", {}, { subscription: "sub_other" });
+  assert.equal(await reader.poll(), 1);
+  assert.deepEqual(ids(), ["ep-1"]);
+  const reasons = lines.filter((line) => line.startsWith("refused")).map((line) => line.split(": ")[1]);
+  assert.deepEqual(reasons, ["bad signature", "bad signature", "timestamp is not close to the time of receipt", "repeat", "event a.moved on a subscription for a.chat", "unknown subscription"]);
+
+  // The mailbox hands the same delivery out again after it was acked.
+  await send(moved, "ep-1", { ok: true });
+  assert.equal(await reader.poll(), 0);
+  assert.deepEqual(ids(), ["ep-1"]);
+});
+
+test("a delivery held in the mailbox is accepted against its time of receipt", async () => {
+  const hour = 60 * 60 * 1000;
+  const { reader, ids, sub } = setUp(["a.moved"], { now: () => Date.now() + 6 * hour });
+  await reader.subscribe();
+  await send(sub("a.moved"), "ep-1", {});
+  assert.equal(await reader.poll(), 1);
+  assert.deepEqual(ids(), ["ep-1"]);
+
+  const late = setUp(["a.moved"], { now: () => Date.now() + 9 * 24 * hour });
+  await late.reader.subscribe();
+  await send(late.sub("a.moved"), "ep-1", {});
+  assert.equal(await late.reader.poll(), 0, "older than the mailbox keeps anything");
+});
+
+test("a restarted reader keeps its hook, secret and position", async () => {
+  const first = setUp(["a.moved"]);
+  await first.reader.subscribe();
+  await send(first.sub("a.moved"), "ep-1", {});
+  assert.equal(await first.reader.poll(), 1);
+
+  const second = setUp(["a.moved"], { stateFile: first.options.stateFile });
+  assert.equal(second.reader.hookUrl, first.reader.hookUrl);
+  await second.reader.subscribe();
+  assert.equal(second.sub("a.moved").secret, first.sub("a.moved").secret);
+  await send(second.sub("a.moved"), "ep-1", {});
+  await send(second.sub("a.moved"), "ep-2", {});
+  assert.equal(await second.reader.poll(), 1);
+  assert.deepEqual(second.ids(), ["ep-2"]);
+  assert.equal(JSON.parse(readFileSync(first.options.stateFile, "utf8")).hook.url, first.reader.hookUrl);
+});
+
+test("two readers on one mailbox each get their own events", async () => {
+  const one = setUp(["a.moved"]);
+  const two = setUp(["a.moved"]);
+  await one.reader.subscribe();
+  await two.reader.subscribe();
+  await send(one.sub("a.moved"), "ep-1", {});
+  await send(two.sub("a.moved"), "ep-2", {});
+  assert.equal(await one.reader.poll(), 1);
+  assert.equal(await two.reader.poll(), 1);
+  assert.deepEqual([one.ids(), two.ids()], [["ep-1"], ["ep-2"]]);
+});
+
+test("a failing handler does not stop the events after it", async () => {
+  const seen: string[] = [];
+  const { reader, lines, sub } = setUp(["a.moved"], {
+    handle: ({ event }) => {
+      if (event.eventId === "ep-1") throw new Error("no");
+      seen.push(event.eventId);
+    },
+  });
+  await reader.subscribe();
+  await send(sub("a.moved"), "ep-1", {});
+  await send(sub("a.moved"), "ep-2", {});
+  await reader.poll();
+  assert.deepEqual(seen, ["ep-2"]);
+  assert.ok(lines.includes("handler failed on ep-1: no"));
+});
+
+test("run subscribes, hands on an event that arrives while it waits, and stops", async () => {
+  const { reader, ids, sub } = setUp(["a.moved"], { waitSeconds: 10 });
+  const stop = new AbortController();
+  const running = reader.run(stop.signal);
+  while (!reader.hookUrl || !sub("a.moved")) await new Promise((resolve) => setTimeout(resolve, 20));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await send(sub("a.moved"), "ep-1", {});
+  const started = Date.now();
+  while (ids().length === 0 && Date.now() - started < 5000) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(ids(), ["ep-1"]);
+  stop.abort();
+  await running;
+  assert.ok(Date.now() - started < 5000, "stops without waiting out the fetch");
+});
+
+test("unsubscribe tells the server and removes the hook", async () => {
+  const { reader, sub } = setUp(["a.gone"]);
+  await reader.subscribe();
+  const url = sub("a.gone").url;
+  await reader.unsubscribe();
+  assert.ok(server.unsubscribed.includes("a.gone"));
+  assert.equal(reader.hookUrl, undefined);
+  assert.equal((await fetch(url, { method: "POST", body: "{}" })).status, 404);
+});

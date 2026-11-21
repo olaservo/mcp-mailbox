@@ -76,8 +76,8 @@ export function reader(target: Target) {
         after = batch.at(-1)!.seq;
       }
     },
-    async ack(upTo: number): Promise<number> {
-      const res = await fetch(`${target.base}/ack`, { method: "POST", headers: auth, body: JSON.stringify({ upTo }) });
+    async ack(upTo: number, hook?: string): Promise<number> {
+      const res = await fetch(`${target.base}/ack`, { method: "POST", headers: auth, body: JSON.stringify({ upTo, hook }) });
       return ((await res.json()) as { deleted: number }).deleted;
     },
   };

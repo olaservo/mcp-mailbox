@@ -38,8 +38,8 @@ export class MemoryStore implements Store {
     return seq;
   }
 
-  async list(after: number, limit: number, waitMs: number): Promise<Delivery[]> {
-    const read = () => this.deliveries.filter((d) => d.seq > after).slice(0, limit);
+  async list(after: number, limit: number, waitMs: number, hook?: string): Promise<Delivery[]> {
+    const read = () => this.deliveries.filter((d) => d.seq > after && (hook === undefined || d.hook === hook)).slice(0, limit);
     let found = read();
     if (found.length === 0 && waitMs > 0) {
       await this.waiters.wait(waitMs);
@@ -48,9 +48,9 @@ export class MemoryStore implements Store {
     return found;
   }
 
-  async ack(upTo: number): Promise<number> {
+  async ack(upTo: number, hook?: string): Promise<number> {
     const before = this.deliveries.length;
-    this.deliveries = this.deliveries.filter((d) => d.seq > upTo);
+    this.deliveries = this.deliveries.filter((d) => d.seq > upTo || (hook !== undefined && d.hook !== hook));
     return before - this.deliveries.length;
   }
 }

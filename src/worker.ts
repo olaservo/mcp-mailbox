@@ -59,10 +59,10 @@ export class Mailbox extends DurableObject<Env> implements Store {
     return seq;
   }
 
-  async list(after: number, limit: number, waitMs: number): Promise<Delivery[]> {
+  async list(after: number, limit: number, waitMs: number, hook?: string): Promise<Delivery[]> {
     const read = () =>
       this.ctx.storage.sql
-        .exec<DeliveryRow>("SELECT seq, hook, received_at, headers, body FROM deliveries WHERE seq > ? ORDER BY seq LIMIT ?", after, limit)
+        .exec<DeliveryRow>("SELECT seq, hook, received_at, headers, body FROM deliveries WHERE seq > ? AND (? IS NULL OR hook = ?) ORDER BY seq LIMIT ?", after, hook ?? null, hook ?? null, limit)
         .toArray()
         .map((row) => ({
           seq: row.seq,
@@ -79,8 +79,8 @@ export class Mailbox extends DurableObject<Env> implements Store {
     return found;
   }
 
-  async ack(upTo: number): Promise<number> {
-    return this.ctx.storage.sql.exec("DELETE FROM deliveries WHERE seq <= ?", upTo).rowsWritten;
+  async ack(upTo: number, hook?: string): Promise<number> {
+    return this.ctx.storage.sql.exec("DELETE FROM deliveries WHERE seq <= ? AND (? IS NULL OR hook = ?)", upTo, hook ?? null, hook ?? null).rowsWritten;
   }
 }
 

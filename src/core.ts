@@ -40,10 +40,10 @@ export interface Store {
   listHooks(): Promise<Hook[]>;
   /** Stores a delivery and returns its sequence number. Also drops deliveries older than `RETENTION_MS`. */
   insert(token: string, receivedAt: number, headers: Record<string, string>, body: Uint8Array): Promise<number | "unknown" | "full">;
-  /** Deliveries with `seq > after`, oldest first. With none and `waitMs > 0`, waits up to that long for one. */
-  list(after: number, limit: number, waitMs: number): Promise<Delivery[]>;
-  /** Deletes deliveries with `seq <= upTo`. Returns how many. */
-  ack(upTo: number): Promise<number>;
+  /** Deliveries with `seq > after`, oldest first, for one hook when `hook` is given. With none and `waitMs > 0`, waits up to that long for one. */
+  list(after: number, limit: number, waitMs: number, hook?: string): Promise<Delivery[]>;
+  /** Deletes deliveries with `seq <= upTo`, for one hook when `hook` is given. Returns how many. */
+  ack(upTo: number, hook?: string): Promise<number>;
 }
 
 export interface MailboxOptions {
@@ -173,13 +173,16 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
       const limit = wholeNumber(url.searchParams.get("limit"), 100, MAX_FETCH);
       const wait = wholeNumber(url.searchParams.get("wait"), 0, MAX_WAIT_MS / 1000);
       if (after === undefined || limit === undefined || wait === undefined) return error(400, "after, limit and wait are whole numbers");
-      const deliveries = await store.list(after, Math.max(1, limit), wait * 1000);
+      const hook = url.searchParams.get("hook") ?? undefined;
+      if (hook !== undefined && !TOKEN.test(hook)) return error(400, "hook is a hook token");
+      const deliveries = await store.list(after, Math.max(1, limit), wait * 1000, hook);
       return json(200, { deliveries: deliveries.map((d) => ({ ...d, body: base64(d.body) })) });
     }
     default: {
-      const input = (await request.json().catch(() => null)) as { upTo?: unknown } | null;
+      const input = (await request.json().catch(() => null)) as { upTo?: unknown; hook?: unknown } | null;
       if (typeof input?.upTo !== "number" || !Number.isSafeInteger(input.upTo) || input.upTo < 0) return error(400, "upTo is a whole number");
-      return json(200, { deleted: await store.ack(input.upTo) });
+      if (input.hook !== undefined && (typeof input.hook !== "string" || !TOKEN.test(input.hook))) return error(400, "hook is a hook token");
+      return json(200, { deleted: await store.ack(input.upTo, input.hook) });
     }
   }
 }
