@@ -28,7 +28,8 @@ test("forge-mcp-server delivers through the mailbox and the reader verifies", { 
     const tip = await mailbox.tip();
     const secret = `whsec_${randomBytes(32).toString("base64")}`;
     const log = new EventLog();
-    const hub = new WebhookHub(log, { insecure: true, retryDelaysMs: [50, 50, 50] });
+    // Against an https mailbox the hub keeps its checks: https only, public addresses only.
+    const hub = new WebhookHub(log, { insecure: !hook.url.startsWith("https:"), retryDelaysMs: [50, 50, 50] });
 
     // The handshake is answered by a mailbox that does not have the secret.
     const move = await hub.subscribe("test:reader", { name: "forge.your_move", delivery: { url: hook.url, secret } });
@@ -45,9 +46,11 @@ test("forge-mcp-server delivers through the mailbox and the reader verifies", { 
       assert.ok(signatureOk(secret, delivery), "verifies with the reader's secret");
       assert.ok(Math.abs(delivery.receivedAt / 1000 - Number(delivery.headers["webhook-timestamp"])) <= 300, "fresh against receivedAt");
     }
-    assert.deepEqual(got.map((d) => d.headers["x-mcp-subscription-id"]), [move.id, move.id, move.id, chat.id]);
+    // The hub POSTs events concurrently, so over a network they arrive in any order.
+    assert.deepEqual(got.map((d) => d.headers["x-mcp-subscription-id"]).sort(), [move.id, move.id, move.id, chat.id].sort());
     assert.equal(new Set(got.map((d) => `${d.headers["x-mcp-subscription-id"]} ${d.headers["webhook-id"]}`)).size, 4, "subscription id and webhook-id make a dedup key");
-    assert.deepEqual(got.slice(0, 3).map((d) => JSON.parse(Buffer.from(d.body, "base64").toString("utf8")).data.prompt), ["play a land 0", "play a land 1", "play a land 2"]);
+    const prompts = got.filter((d) => d.headers["x-mcp-subscription-id"] === move.id).map((d) => JSON.parse(Buffer.from(d.body, "base64").toString("utf8")).data.prompt);
+    assert.deepEqual(prompts.sort(), ["play a land 0", "play a land 1", "play a land 2"]);
 
     assert.ok(!signatureOk(`whsec_${randomBytes(32).toString("base64")}`, got[0]!), "a different secret does not verify");
     await mailbox.ack(got.at(-1)!.seq);

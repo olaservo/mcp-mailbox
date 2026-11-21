@@ -2,7 +2,7 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox is built and tested locally. It is not deployed. The reader and the encryption experiment are not started.
+Status: the mailbox is built and deployed at `https://mcp-mailbox.olahungerford.workers.dev` (2026-11-21). The reader and the encryption experiment are not started.
 
 ## Parts
 
@@ -16,7 +16,8 @@ It has no signing secret, so it cannot forge or alter a delivery without the rea
 
 - verify `webhook-signature` over the stored bytes with its own secret;
 - check `webhook-timestamp` against the delivery's `receivedAt`, since a held delivery is older than 5 minutes by the reader's clock;
-- deduplicate on `x-mcp-subscription-id` plus `webhook-id`.
+- deduplicate on `x-mcp-subscription-id` plus `webhook-id`;
+- order events by their own content. `seq` is arrival order. Observed against the deployed mailbox: forge-mcp-server POSTs events concurrently, and four events emitted in order arrived in another order.
 
 A server that does not replay over webhook loses any event it emits while the mailbox is down past its retries.
 
@@ -68,8 +69,9 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 
 - 10 of 10 tests pass against the in-memory mailbox.
 - 9 pass against the Worker under `wrangler dev` (workerd, SQLite Durable Object). The tenth sets a storage limit and only runs in memory.
-- In both, forge-mcp-server's hub passes its verification handshake against the mailbox, and four deliveries from two subscriptions verify with the reader's secret.
+- The same 9 pass against the deployed Worker.
+- In all three, forge-mcp-server's hub passes its verification handshake against the mailbox, and four deliveries from two subscriptions verify with the reader's secret. Against the deployed Worker the hub ran with `insecure` off, so its `https` and public-address checks applied.
 
-Not tested: a deployed mailbox on public `https`, a server with its `insecure` option off, and what a held `wait` request costs in Durable Object duration.
+Not tested: a real game through the mailbox, and what a held `wait` request costs in Durable Object duration.
 
 `spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written. It also shows the cases a reader has to handle: a mailbox that alters, invents or repeats a delivery, and a mailbox that is down.
