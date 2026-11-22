@@ -28,6 +28,8 @@ interface Subscribed {
   url: string;
   secret: string;
   headers: Record<string, string | string[] | undefined>;
+  /** The cursor the request carried. */
+  cursor: string | null;
 }
 
 /** Stands in for an MCP server: answers `events/subscribe` after a challenge to the callback, and records the request. */
@@ -38,7 +40,7 @@ async function fakeServer() {
     let text = "";
     req.on("data", (chunk) => (text += chunk));
     req.on("end", async () => {
-      const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; delivery: { url: string; secret: string } } };
+      const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; cursor: string | null; delivery: { url: string; secret: string } } };
       const reply = (body: object) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
       if (method === "events/unsubscribe") {
         unsubscribed.push(params.name);
@@ -49,9 +51,9 @@ async function fakeServer() {
       if (((await echoed.json().catch(() => ({}))) as { challenge?: string }).challenge !== challenge) {
         return reply({ error: { code: -32027, message: "CallbackEndpointError" } });
       }
-      const sub = { id: `sub_${params.name}`, name: params.name, url: params.delivery.url, secret: params.delivery.secret, headers: req.headers };
+      const sub = { id: `sub_${params.name}`, name: params.name, url: params.delivery.url, secret: params.delivery.secret, headers: req.headers, cursor: params.cursor };
       subscribed.push(sub);
-      reply({ result: { id: sub.id, refreshBefore: new Date(Date.now() + 3600_000).toISOString(), cursor: null, truncated: false } });
+      reply({ result: { id: sub.id, refreshBefore: new Date(Date.now() + 3600_000).toISOString(), cursor: `c:${subscribed.length}`, truncated: false } });
     });
   });
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
@@ -179,6 +181,21 @@ test("a restarted reader keeps its hook, secret and position", async () => {
   await send(second.sub("a.moved"), "ep-2", {});
   assert.equal(await second.reader.poll(), 1);
   assert.deepEqual(second.ids(), ["ep-2"]);
+});
+
+test("a refresh sends back the cursor the server returned, also after a restart", async () => {
+  const first = setUp(["a.moved"]);
+  await first.reader.subscribe();
+  const made = first.sub("a.moved");
+  assert.equal(made.cursor, null);
+  const returned = `c:${server.subscribed.indexOf(made) + 1}`;
+  await first.reader.subscribe();
+  assert.equal(first.sub("a.moved").cursor, returned);
+
+  const second = setUp(["a.moved"], { stateFile: first.options.stateFile });
+  const again = `c:${server.subscribed.length}`;
+  await second.reader.subscribe();
+  assert.equal(second.sub("a.moved").cursor, again);
 });
 
 test("two readers on one mailbox each get their own events", async () => {

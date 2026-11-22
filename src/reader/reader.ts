@@ -46,6 +46,8 @@ interface State {
   after: number;
   /** Event name to the id of the subscription the server granted. */
   subscriptions: Record<string, string>;
+  /** Event name to the cursor the server last returned from `events/subscribe`. Sent back, so a subscription that lapsed is replayed from it. */
+  cursors: Record<string, string>;
   /** `<subscription id> <webhook-id>` of handled deliveries, with the time of receipt. */
   seen: Record<string, number>;
 }
@@ -53,8 +55,8 @@ interface State {
 const PROTOCOL_VERSION = "2026-07-28";
 /** Subscription lifetime asked for. */
 const TTL_MS = 60 * 60 * 1000;
-/** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart. */
-const REFRESH_MS = 5 * 60 * 1000;
+/** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart, and events emitted before it does are not delivered. */
+const REFRESH_MS = 60 * 1000;
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
@@ -110,10 +112,11 @@ export class Reader {
         arguments: {},
         delivery: { mode: "webhook", url: hook.url, secret: this.state.secret },
         ttlMs: TTL_MS,
-        cursor: null,
-      })) as { id: string; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
+        cursor: this.state.cursors[name] ?? null,
+      })) as { id: string; cursor?: string | null; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
       if (this.state.subscriptions[name] !== result.id) this.log(`subscribed ${name} as ${result.id}`);
       this.state.subscriptions[name] = result.id;
+      if (typeof result.cursor === "string") this.state.cursors[name] = result.cursor;
       if (result.refreshBefore) lapses = Math.min(lapses, Date.parse(result.refreshBefore));
       if (result.truncated) this.log(`${name}: the server reports a gap`);
       if (result.deliveryStatus?.lastError) this.log(`${name}: the server's last delivery failed: ${result.deliveryStatus.lastError}, failing since ${result.deliveryStatus.failedSince ?? "unknown"}`);
@@ -132,6 +135,7 @@ export class Reader {
     await this.mailbox("DELETE", `/hooks/${hook.token}`);
     this.state.hook = undefined;
     this.state.subscriptions = {};
+    this.state.cursors = {};
     this.save();
   }
 
@@ -296,7 +300,7 @@ export class Reader {
   }
 
   private load(): State {
-    const fresh: State = { secret: `whsec_${randomBytes(32).toString("base64")}`, after: 0, subscriptions: {}, seen: {} };
+    const fresh: State = { secret: `whsec_${randomBytes(32).toString("base64")}`, after: 0, subscriptions: {}, cursors: {}, seen: {} };
     if (!existsSync(this.opts.stateFile)) return fresh;
     return { ...fresh, ...(JSON.parse(readFileSync(this.opts.stateFile, "utf8")) as Partial<State>) };
   }

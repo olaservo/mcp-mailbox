@@ -57,7 +57,8 @@ node --env-file=<file> src/reader/cli.ts unsubscribe  # unsubscribe and remove t
 What it does:
 
 - Creates one hook in the mailbox and a `whsec_` secret on first run, and keeps both in the state file.
-- Sends `events/subscribe` for each event as a single 2026-07-28 request with no session. It repeats this every 5 minutes, or at half the granted lifetime when that is sooner. The repeat is the refresh, and it restores a subscription the server lost in a restart.
+- Sends `events/subscribe` for each event as a single 2026-07-28 request with no session. It repeats this every minute, or at half the granted lifetime when that is sooner. The repeat is the refresh, and it restores a subscription the server lost in a restart.
+- Keeps the cursor each `events/subscribe` returns and sends it with the next one, so a server that replays from a cursor resends what a lapsed subscription missed. A repeat is dropped by the check below.
 - Fetches with `wait=25` and `hook=<its token>`, so several readers can share one mailbox. After a fetch returns deliveries it fetches again 500 ms later, so events POSTed together are ordered together.
 - Skips a delivery, with a log line, when:
   - the signature does not verify;
@@ -82,7 +83,8 @@ Limits:
 
 - A handler that fails is logged and the event is not tried again.
 - Ordering holds within a batch. An event that arrives after its batch was handed on is handed on late.
-- It does not detect a dropped event. forge-mcp-server sends `cursor: null` over webhook.
+- Events a server emits after a restart and before the next refresh are not delivered, for up to a minute. A cursor from before the restart does not bring them back on forge-mcp-server, whose cursors are per process. forge-mcp-server sends a new subscription the ask that is still pending (`76c7b3f`), and can keep subscriptions across restarts in a file (`FORGE_MCP_SUBSCRIPTIONS`, not tried with the reader).
+- A gap the server reports (`truncated`) is logged and not passed on to the handler or the poll endpoint.
 - The secret is not rotated.
 - `gap` and `terminated` envelopes are logged and nothing else is done.
 
@@ -130,6 +132,12 @@ Reader, 2026-11-21, with forge-mcp-server checked out at `c2fa1e4` and its `dist
 - The CLI was run once with `READER_POLL_PORT` against the same two. Three events emitted by forge-mcp-server were read by a client polling once a second with the mod's request, 1.1 s after they were emitted. The mod's `register.ts` (forge-mcp-server `c2fa1e4`) was then run in Node against it, with a stand-in for the engine that does real HTTP and timers: an event between turns was submitted as a prompt once, and three events during a turn were held and the newest of each name submitted when the turn ended. Not run: the mod in a Claude Code session.
 - After the Worker was deployed with `hook` on `/deliveries` and `/ack` (version `ba05efcf`), every test that applies passes against it, including two readers on one mailbox.
 
-Not tested: a real game through the mailbox, a reader left running for hours, and what a held `wait` request costs in Durable Object duration.
+Game, 2026-11-22, forge-mcp-server `main` with the `mcp-events` mod polling the reader's endpoint, through the deployed mailbox. Counts are from the server's activity log as read by the session that ran the game, not counted line by line:
+
+- A Claude Code seat played 23 game turns between 18:18Z and 18:58Z. The server emitted 153 `forge.your_move` and 3 `forge.chat`. Every delivery line read was 200 on the first attempt, in 50 to 170 ms. The mod started about 45 turns and reported no missed events.
+- Before the game the server restarted at about 17:25Z. The reader, then refreshing every 5 minutes, subscribed again at 17:29:35Z. The four events emitted in between (`3c794fbd-1` to `-4`, the last one the coin-toss ask) were never delivered, and the seat waited on the coin toss until a person asked. The refresh is now every minute, and the server now sends a new subscription the pending ask. Neither has been run through a restart.
+- The reader ran for 17 hours before the game. It logged three failed mailbox fetches, one of them a 500 from the mailbox, and went on after each.
+
+Not tested: a server restart with the changes above, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
 
 `spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written. It also shows the cases a reader has to handle: a mailbox that alters, invents or repeats a delivery, and a mailbox that is down.
