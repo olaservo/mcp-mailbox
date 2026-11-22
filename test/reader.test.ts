@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -311,4 +311,81 @@ test("a polling client gets the reader's events from the poll endpoint", async (
   } finally {
     await served.close();
   }
+});
+
+test("servers in the directory are each subscribed, with the token from the file", async () => {
+  const other = await fakeServer();
+  const dir = mkdtempSync(join(tmpdir(), "servers-"));
+  // The first file names the server the reader already has.
+  writeFileSync(join(dir, "1.json"), JSON.stringify({ url: server.url }));
+  writeFileSync(join(dir, "2.json"), JSON.stringify({ url: other.url, token: "t2" }));
+  // A file still being written has another name. Subscribing to this one would fail.
+  writeFileSync(join(dir, "3.json.tmp"), JSON.stringify({ url: "http://127.0.0.1:9/mcp" }));
+  const { reader, ids, lines, sub } = setUp(["a.moved"], { servers: { dir, token: "unused" } });
+  const fromOther = () => other.subscribed.filter((s) => s.url === reader.hookUrl);
+  try {
+    await reader.subscribe();
+    assert.equal(server.subscribed.filter((s) => s.url === reader.hookUrl).length, 1, "the server named twice is subscribed once");
+    assert.equal(sub("a.moved").headers.authorization, "Bearer s3cret");
+    assert.equal(fromOther().length, 1);
+    assert.equal(fromOther()[0]!.headers.authorization, "Bearer t2");
+
+    // Both servers grant the same subscription id, as two forge-mcp-server processes with one token do.
+    await send(sub("a.moved"), "one-1", {});
+    await send(fromOther()[0]!, "two-1", {});
+    assert.equal(await reader.poll(), 2);
+    assert.deepEqual(ids().sort(), ["one-1", "two-1"]);
+    assert.deepEqual(lines.filter((line) => line.startsWith("skipped")), []);
+
+    rmSync(join(dir, "2.json"));
+    await reader.subscribe();
+    assert.equal(fromOther().length, 1, "a server whose file is gone is not refreshed");
+    assert.equal(sub("a.moved").cursor !== null, true, "the remaining server is");
+  } finally {
+    await other.close();
+  }
+});
+
+test("run subscribes to a server that appears in the directory, and goes on when one is down", async () => {
+  const other = await fakeServer();
+  const dir = join(mkdtempSync(join(tmpdir(), "servers-")), "not-yet");
+  const { reader, ids, lines } = setUp(["a.moved"], { server: undefined, servers: { dir }, scanMs: 50, waitSeconds: 1 });
+  const stop = new AbortController();
+  const running = reader.run(stop.signal);
+  const until = async (done: () => boolean) => {
+    for (const started = Date.now(); !done() && Date.now() - started < 5000; ) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(done());
+  };
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(reader.hookUrl, undefined, "nothing to do before a server appears");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "down.json"), JSON.stringify({ url: "http://127.0.0.1:9/mcp" }));
+    writeFileSync(join(dir, "up.json"), JSON.stringify({ url: other.url }));
+    const made = () => other.subscribed.find((s) => s.url === reader.hookUrl);
+    await until(() => made() !== undefined);
+    await send(made()!, "two-1", {});
+    await until(() => ids().length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(lines.filter((line) => line.startsWith("subscribe failed at http://127.0.0.1:9/mcp")).length, 1, "the server that is down is logged and does not stop the other");
+  } finally {
+    stop.abort();
+    await running;
+    await other.close();
+  }
+});
+
+test("a state file from before several servers keeps its subscriptions and cursors", async () => {
+  const first = setUp(["a.moved"]);
+  await first.reader.subscribe();
+  const made = first.sub("a.moved");
+  const state = JSON.parse(readFileSync(first.options.stateFile, "utf8"));
+  const { servers, ...rest } = state;
+  writeFileSync(first.options.stateFile, JSON.stringify({ ...rest, ...servers[server.url] }));
+
+  const second = setUp(["a.moved"], { stateFile: first.options.stateFile });
+  await send(made, "ep-1", {});
+  assert.equal(await second.reader.poll(), 1, "the subscription id is still known");
+  await second.reader.subscribe();
+  assert.equal(second.sub("a.moved").cursor, servers[server.url].cursors["a.moved"]);
 });

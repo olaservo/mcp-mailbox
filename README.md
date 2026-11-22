@@ -48,6 +48,7 @@ node --env-file=<file> src/reader/cli.ts unsubscribe  # unsubscribe and remove t
 | `MAILBOX_URL`, `MAILBOX_KEY` | The mailbox and the reader's key. |
 | `READER_SERVER_URL` | The MCP server's Streamable HTTP endpoint, such as `https://host/mcp`. |
 | `READER_SERVER_TOKEN` | Its bearer token. For forge-mcp-server this is `FORGE_MCP_TOKEN`. |
+| `READER_SERVERS_DIR` | A directory where servers announce themselves. Takes the place of `READER_SERVER_URL`, or adds to it. See below. |
 | `READER_EVENTS` | Event names, comma separated, such as `forge.your_move,forge.chat`. |
 | `READER_EXEC` | A command run once per event through the shell, with the event as JSON on stdin and `MCP_EVENT_NAME`, `MCP_EVENT_ID` and `MCP_SUBSCRIPTION_ID` set. Without it, each event is one JSON line on stdout. |
 | `READER_POLL_PORT` | Serves the events as MCP Events poll delivery on `127.0.0.1:<port>`. Takes the place of `READER_EXEC`. See below. |
@@ -69,6 +70,17 @@ What it does:
   - it has handled the delivery before.
 - Orders a batch by the number at the end of `eventId` when the ids share a prefix, otherwise by `timestamp`, then by arrival.
 - Hands events on one at a time, saves its position, then acks. A reader stopped between handing on and saving hands the batch on again at the next start.
+
+### Several servers
+
+With `READER_SERVERS_DIR` set, the reader subscribes to every server that has a file in that directory. One hook and one poll endpoint serve them all.
+
+- A server writes one `*.json` file with `url`, and `token` when its bearer token is not `READER_SERVER_TOKEN`. It removes the file when it exits. A file being written needs a name that does not end in `.json`.
+- The directory is read every 5 seconds. A new file is subscribed at the next read. A server whose file is gone is no longer refreshed, and it is not sent `events/unsubscribe`.
+- Servers are told apart by `url`, so one named in a file and in `READER_SERVER_URL` is subscribed once.
+- A server that cannot be reached is tried again every 15 seconds, and the failure is logged once until it changes.
+- The reader sends its token, or the file's, to whatever `url` a file names. Keep the directory writable by the user only.
+- Events from every server are in one log on the poll endpoint. A client that wants one server's events picks them by event id, as the `mcp-events` mod does with `ownOnly`.
 
 ### Poll endpoint
 
@@ -138,6 +150,8 @@ Game, 2026-11-22, forge-mcp-server `main` with the `mcp-events` mod polling the 
 - Before the game the server restarted at about 17:25Z. The reader, then refreshing every 5 minutes, subscribed again at 17:29:35Z. The four events emitted in between (`3c794fbd-1` to `-4`, the last one the coin-toss ask) were never delivered, and the seat waited on the coin toss until a person asked. The refresh is now every minute, and the server now sends a new subscription the pending ask. Neither has been run through a restart.
 - The reader ran for 17 hours before the game. It logged three failed mailbox fetches, one of them a 500 from the mailbox, and went on after each.
 
-Not tested: a server restart with the changes above, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
+Several servers, 2026-11-22, with forge-mcp-server branch `session-ports` at `bcd8437`: two server processes started 4 seconds apart, the second on a free port, each wrote its file, and one reader with a 1 second directory read subscribed to each about a second after it started. No event was sent through them.
+
+Not tested: events from two servers in a real session, a server restart with the changes above, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
 
 `spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written. It also shows the cases a reader has to handle: a mailbox that alters, invents or repeats a delivery, and a mailbox that is down.

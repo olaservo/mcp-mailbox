@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { MAX_HELD_MS, refusal, type Fetched } from "./verify.ts";
 
 /** An event occurrence as SEP-3415 delivers it by webhook. */
@@ -20,10 +20,21 @@ export interface Received {
   event: EventBody;
 }
 
+export interface Server {
+  url: string;
+  token?: string;
+}
+
 export interface ReaderOptions {
   mailbox: { url: string; key: string };
-  /** The MCP server's Streamable HTTP endpoint, and its bearer token. */
-  server: { url: string; token?: string };
+  /** An MCP server's Streamable HTTP endpoint, and its bearer token. */
+  server?: Server;
+  /**
+   * A directory where servers announce themselves, one `*.json` file each with `url` and optionally `token`.
+   * It is read again every `scanMs`. `token` here is for a file without one.
+   */
+  servers?: { dir: string; token?: string };
+  scanMs?: number;
   /** Event names to subscribe to. */
   events: string[];
   /** JSON file with the signing secret, the hook and the position in the mailbox. */
@@ -44,10 +55,8 @@ interface State {
   hook?: { token: string; url: string };
   /** The highest mailbox sequence number handled. */
   after: number;
-  /** Event name to the id of the subscription the server granted. */
-  subscriptions: Record<string, string>;
-  /** Event name to the cursor the server last returned from `events/subscribe`. Sent back, so a subscription that lapsed is replayed from it. */
-  cursors: Record<string, string>;
+  /** Per server URL: event name to the id of the subscription it granted, and to the cursor it last returned from `events/subscribe`. The cursor is sent back, so a subscription that lapsed is replayed from it. */
+  servers: Record<string, { subscriptions: Record<string, string>; cursors: Record<string, string> }>;
   /** `<subscription id> <webhook-id>` of handled deliveries, with the time of receipt. */
   seen: Record<string, number>;
 }
@@ -57,6 +66,8 @@ const PROTOCOL_VERSION = "2026-07-28";
 const TTL_MS = 60 * 60 * 1000;
 /** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart, and events emitted before it does are not delivered. */
 const REFRESH_MS = 60 * 1000;
+/** A server that could not be subscribed is tried again after this long. */
+const RETRY_MS = 15 * 1000;
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
@@ -94,6 +105,7 @@ export class Reader {
     this.opts = opts;
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? (() => {});
+    if (!opts.server && !opts.servers) throw new Error("no server to subscribe to");
     this.state = this.load();
   }
 
@@ -102,40 +114,34 @@ export class Reader {
     return this.state.hook?.url;
   }
 
-  /** Subscribes or refreshes every event. Creates the hook first when the mailbox does not have it. Returns when the first subscription lapses. */
+  /** Subscribes or refreshes every event on every server. Creates the hook first when the mailbox does not have it. Returns when the first subscription lapses. */
   async subscribe(): Promise<number> {
     const hook = await this.ensureHook();
     let lapses = Infinity;
-    for (const name of this.opts.events) {
-      const result = (await this.rpc("events/subscribe", {
-        name,
-        arguments: {},
-        delivery: { mode: "webhook", url: hook.url, secret: this.state.secret },
-        ttlMs: TTL_MS,
-        cursor: this.state.cursors[name] ?? null,
-      })) as { id: string; cursor?: string | null; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
-      if (this.state.subscriptions[name] !== result.id) this.log(`subscribed ${name} as ${result.id}`);
-      this.state.subscriptions[name] = result.id;
-      if (typeof result.cursor === "string") this.state.cursors[name] = result.cursor;
-      if (result.refreshBefore) lapses = Math.min(lapses, Date.parse(result.refreshBefore));
-      if (result.truncated) this.log(`${name}: the server reports a gap`);
-      if (result.deliveryStatus?.lastError) this.log(`${name}: the server's last delivery failed: ${result.deliveryStatus.lastError}, failing since ${result.deliveryStatus.failedSince ?? "unknown"}`);
+    let failure: unknown;
+    for (const server of this.servers()) {
+      try {
+        lapses = Math.min(lapses, await this.subscribeTo(server, hook.url));
+      } catch (err) {
+        failure ??= err;
+      }
     }
-    this.save();
+    if (failure) throw failure;
     return lapses;
   }
 
-  /** Unsubscribes every event and removes the hook. */
+  /** Unsubscribes every event on every server and removes the hook. */
   async unsubscribe(): Promise<void> {
     const hook = this.state.hook;
     if (!hook) return;
-    for (const name of this.opts.events) {
-      await this.rpc("events/unsubscribe", { name, arguments: {}, delivery: { mode: "webhook", url: hook.url } });
+    for (const server of this.servers()) {
+      for (const name of this.opts.events) {
+        await this.rpc(server, "events/unsubscribe", { name, arguments: {}, delivery: { mode: "webhook", url: hook.url } });
+      }
     }
     await this.mailbox("DELETE", `/hooks/${hook.token}`);
     this.state.hook = undefined;
-    this.state.subscriptions = {};
-    this.state.cursors = {};
+    this.state.servers = {};
     this.save();
   }
 
@@ -188,17 +194,50 @@ export class Reader {
   /** Subscribes, then fetches and refreshes until `signal` aborts. A failed request is logged and tried again. */
   async run(signal: AbortSignal): Promise<void> {
     this.stopping = signal;
+    /** Per server URL, when to subscribe next. */
+    const due = new Map<string, number>();
+    /** The last failure logged for a server or for the mailbox, so a repeat is logged once. */
+    const failed = new Map<string, string>();
+    const fail = (key: string, err: unknown) => {
+      const message = (err as Error).message;
+      if (failed.get(key) !== message) this.log(`subscribe failed at ${key}: ${message}`);
+      failed.set(key, message);
+    };
     const refreshing = (async () => {
       while (!signal.aborted) {
-        let wait = 15_000;
-        try {
-          // Half the granted lifetime, so one failed refresh leaves time for another.
-          wait = Math.max(1000, Math.min(REFRESH_MS, ((await this.subscribe()) - Date.now()) / 2));
-        } catch (err) {
-          if (signal.aborted) break;
-          this.log(`subscribe failed: ${(err as Error).message}`);
+        const servers = this.servers();
+        for (const url of due.keys()) if (!servers.some((server) => server.url === url)) due.delete(url);
+        let ready = servers.filter((server) => (due.get(server.url) ?? 0) <= Date.now());
+        if (ready.length > 0) {
+          let hookUrl: string | undefined;
+          try {
+            const held = this.state.hook?.token;
+            const hook = await this.ensureHook();
+            // A new hook is a new callback URL for every server.
+            if (held !== hook.token) ready = servers;
+            hookUrl = hook.url;
+            failed.delete("the mailbox");
+          } catch (err) {
+            if (signal.aborted) break;
+            fail("the mailbox", err);
+          }
+          for (const server of ready) {
+            let wait = RETRY_MS;
+            try {
+              if (hookUrl === undefined) continue;
+              // Half the granted lifetime, so one failed refresh leaves time for another.
+              wait = Math.max(1000, Math.min(REFRESH_MS, ((await this.subscribeTo(server, hookUrl)) - Date.now()) / 2));
+              failed.delete(server.url);
+            } catch (err) {
+              if (signal.aborted) break;
+              fail(server.url, err);
+            } finally {
+              due.set(server.url, Date.now() + wait);
+            }
+          }
         }
-        await sleep(wait, signal);
+        const next = Math.min(...due.values()) - Date.now();
+        await sleep(this.opts.servers ? (this.opts.scanMs ?? 5000) : Math.max(1000, next), signal);
       }
     })();
     let failures = 0;
@@ -224,7 +263,7 @@ export class Reader {
     const why = refusal(this.state.secret, delivery, now);
     if (why) return why;
     const subscriptionId = delivery.headers["x-mcp-subscription-id"]!;
-    const name = Object.keys(this.state.subscriptions).find((n) => this.state.subscriptions[n] === subscriptionId);
+    const name = Object.values(this.state.servers).flatMap((server) => Object.entries(server.subscriptions)).find(([, id]) => id === subscriptionId)?.[0];
     if (name === undefined) return "unknown subscription";
     let body: (Partial<EventBody> & { type?: unknown }) | null;
     try {
@@ -240,6 +279,54 @@ export class Reader {
     return { subscriptionId, webhookId: delivery.headers["webhook-id"]!, receivedAt: delivery.receivedAt, event: body as EventBody };
   }
 
+  /** The servers to subscribe to now. One whose file is gone is forgotten. */
+  private servers(): Server[] {
+    const found = new Map<string, Server>();
+    if (this.opts.server) found.set(this.opts.server.url, this.opts.server);
+    const registry = this.opts.servers;
+    let files: string[] = [];
+    try {
+      if (registry) files = readdirSync(registry.dir).filter((name) => name.endsWith(".json"));
+    } catch {
+      // No directory yet: no server has started.
+    }
+    for (const name of files) {
+      try {
+        const entry = JSON.parse(readFileSync(join(registry!.dir, name), "utf8")) as { url?: unknown; token?: unknown };
+        if (typeof entry.url !== "string") continue;
+        const token = typeof entry.token === "string" ? entry.token : (found.get(entry.url)?.token ?? registry!.token);
+        found.set(entry.url, { url: entry.url, token });
+      } catch {
+        // A file removed or half written since the listing. The next scan reads it.
+      }
+    }
+    for (const url of Object.keys(this.state.servers)) if (!found.has(url)) delete this.state.servers[url];
+    return [...found.values()];
+  }
+
+  /** Subscribes or refreshes every event on one server. Returns when its first subscription lapses. */
+  private async subscribeTo(server: Server, hookUrl: string): Promise<number> {
+    const held = (this.state.servers[server.url] ??= { subscriptions: {}, cursors: {} });
+    let lapses = Infinity;
+    for (const name of this.opts.events) {
+      const result = (await this.rpc(server, "events/subscribe", {
+        name,
+        arguments: {},
+        delivery: { mode: "webhook", url: hookUrl, secret: this.state.secret },
+        ttlMs: TTL_MS,
+        cursor: held.cursors[name] ?? null,
+      })) as { id: string; cursor?: string | null; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
+      if (held.subscriptions[name] !== result.id) this.log(`subscribed ${name} as ${result.id} at ${server.url}`);
+      held.subscriptions[name] = result.id;
+      if (typeof result.cursor === "string") held.cursors[name] = result.cursor;
+      if (result.refreshBefore) lapses = Math.min(lapses, Date.parse(result.refreshBefore));
+      if (result.truncated) this.log(`${name} at ${server.url}: the server reports a gap`);
+      if (result.deliveryStatus?.lastError) this.log(`${name} at ${server.url}: the server's last delivery failed: ${result.deliveryStatus.lastError}, failing since ${result.deliveryStatus.failedSince ?? "unknown"}`);
+    }
+    this.save();
+    return lapses;
+  }
+
   private async ensureHook(): Promise<{ token: string; url: string }> {
     const held = this.state.hook;
     if (held) {
@@ -249,7 +336,7 @@ export class Reader {
     }
     const created = (await (await this.mailbox("POST", "/hooks", { label: this.opts.label ?? "reader" })).json()) as { token: string; url: string };
     this.state.hook = { token: created.token, url: created.url };
-    this.state.subscriptions = {};
+    for (const server of Object.values(this.state.servers)) server.subscriptions = {};
     this.save();
     return this.state.hook;
   }
@@ -266,8 +353,8 @@ export class Reader {
   }
 
   /** One JSON-RPC request over Streamable HTTP, in the 2026-07-28 form: no session, the envelope in `_meta`. */
-  private async rpc(method: string, params: { name: string } & Record<string, unknown>): Promise<unknown> {
-    const { url, token } = this.opts.server;
+  private async rpc(server: Server, method: string, params: { name: string } & Record<string, unknown>): Promise<unknown> {
+    const { url, token } = server;
     const name = /^[\x20-\x7e]*$/.test(params.name) ? params.name : `=?base64?${Buffer.from(params.name).toString("base64")}?=`;
     const meta = {
       "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
@@ -300,9 +387,13 @@ export class Reader {
   }
 
   private load(): State {
-    const fresh: State = { secret: `whsec_${randomBytes(32).toString("base64")}`, after: 0, subscriptions: {}, cursors: {}, seen: {} };
+    const fresh: State = { secret: `whsec_${randomBytes(32).toString("base64")}`, after: 0, servers: {}, seen: {} };
     if (!existsSync(this.opts.stateFile)) return fresh;
-    return { ...fresh, ...(JSON.parse(readFileSync(this.opts.stateFile, "utf8")) as Partial<State>) };
+    const { subscriptions, cursors, ...kept } = JSON.parse(readFileSync(this.opts.stateFile, "utf8")) as Partial<State> & { subscriptions?: Record<string, string>; cursors?: Record<string, string> };
+    const state = { ...fresh, ...kept };
+    // A state file from before the reader took several servers.
+    if (subscriptions && this.opts.server && !kept.servers) state.servers[this.opts.server.url] = { subscriptions, cursors: cursors ?? {} };
+    return state;
   }
 
   private save(): void {

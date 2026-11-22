@@ -9,6 +9,9 @@ const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
   MAILBOX_URL, MAILBOX_KEY   the mailbox and the reader's key
   READER_SERVER_URL          the MCP server's Streamable HTTP endpoint, such as https://host/mcp
   READER_SERVER_TOKEN        its bearer token
+  READER_SERVERS_DIR         a directory where servers announce themselves, one *.json file each with
+                             "url" and optionally "token". Each one is subscribed. Takes the place of
+                             READER_SERVER_URL, or adds to it.
   READER_EVENTS              event names, comma separated
   READER_EXEC                a command run once per event, with the event as JSON on stdin.
                              Without it, each event is one JSON line on stdout.
@@ -18,7 +21,8 @@ const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
   READER_LABEL               the hook's label in the mailbox`;
 
 const env = process.env;
-const missing = ["MAILBOX_URL", "MAILBOX_KEY", "READER_SERVER_URL", "READER_EVENTS"].filter((name) => !env[name]);
+const missing = ["MAILBOX_URL", "MAILBOX_KEY", "READER_EVENTS"].filter((name) => !env[name]);
+if (!env.READER_SERVER_URL && !env.READER_SERVERS_DIR) missing.push("READER_SERVER_URL or READER_SERVERS_DIR");
 const command = process.argv[2] ?? "run";
 if (missing.length > 0 || !["run", "unsubscribe"].includes(command)) {
   console.error(missing.length > 0 ? `Not set: ${missing.join(", ")}\n\n${USAGE}` : USAGE);
@@ -47,7 +51,8 @@ const endpoint = env.READER_POLL_PORT ? new PollEndpoint(events) : undefined;
 
 const reader = new Reader({
   mailbox: { url: env.MAILBOX_URL!, key: env.MAILBOX_KEY! },
-  server: { url: env.READER_SERVER_URL!, token: env.READER_SERVER_TOKEN },
+  server: env.READER_SERVER_URL ? { url: env.READER_SERVER_URL, token: env.READER_SERVER_TOKEN } : undefined,
+  servers: env.READER_SERVERS_DIR ? { dir: env.READER_SERVERS_DIR, token: env.READER_SERVER_TOKEN } : undefined,
   events,
   stateFile: env.READER_STATE ?? join(homedir(), ".mcp-mailbox", "reader-state.json"),
   label: env.READER_LABEL,
@@ -66,6 +71,6 @@ if (command === "unsubscribe") {
   const stop = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => stop.abort());
   if (endpoint) log(`serving events/poll on http://127.0.0.1:${(await endpoint.listen(Number(env.READER_POLL_PORT))).port}`);
-  log(`reading ${env.MAILBOX_URL} for ${env.READER_EVENTS} from ${env.READER_SERVER_URL}`);
+  log(`reading ${env.MAILBOX_URL} for ${env.READER_EVENTS} from ${[env.READER_SERVER_URL, env.READER_SERVERS_DIR].filter(Boolean).join(" and ")}`);
   await reader.run(stop.signal);
 }
