@@ -127,7 +127,7 @@ Reader, 2026-11-21, with forge-mcp-server checked out at `c2fa1e4` and its `dist
 - The reader tests pass against the in-memory mailbox and against the Worker under `wrangler dev`, with a stand-in MCP server.
 - With `FORGE_MCP_SERVER` set, the reader subscribes to forge-mcp-server's HTTP endpoint with a bearer token, and four events emitted in order are handed on in order. Passes in memory, under `wrangler dev` and against the deployed Worker.
 - The CLI was run once against the in-memory mailbox and forge-mcp-server, printing events and with `READER_EXEC`.
-- The CLI was run once with `READER_POLL_PORT` against the same two. Three events emitted by forge-mcp-server were read by a client polling once a second with the mod's request, 1.1 s after they were emitted. The mod itself was not run against it.
+- The CLI was run once with `READER_POLL_PORT` against the same two. Three events emitted by forge-mcp-server were read by a client polling once a second with the mod's request, 1.1 s after they were emitted. The mod's `register.ts` (forge-mcp-server `c2fa1e4`) was then run in Node against it, with a stand-in for the engine that does real HTTP and timers: an event between turns was submitted as a prompt once, and three events during a turn were held and the newest of each name submitted when the turn ended. Not run: the mod in a Claude Code session.
 - After the Worker was deployed with `hook` on `/deliveries` and `/ack` (version `ba05efcf`), every test that applies passes against it, including two readers on one mailbox.
 
 Not tested: a real game through the mailbox, a reader left running for hours, and what a held `wait` request costs in Durable Object duration.
