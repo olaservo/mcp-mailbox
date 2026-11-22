@@ -145,6 +145,21 @@ export class Reader {
     this.save();
   }
 
+  /** What each server says is still waiting for `name`: its answer to a poll with no cursor. A server that fails or is slow is left out. */
+  async pending(name: string): Promise<EventBody[]> {
+    const answers = await Promise.all(
+      this.servers().map(async (server) => {
+        try {
+          const result = (await this.rpc(server, "events/poll", { name, arguments: {}, cursor: null }, AbortSignal.timeout(2000))) as { events?: EventBody[] };
+          return (result.events ?? []).filter((event) => event.name === name);
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return answers.flat();
+  }
+
   /** One fetch from the mailbox. Returns how many events were handed on. */
   async poll(waitSeconds = 0): Promise<number> {
     const hook = this.state.hook;
@@ -353,7 +368,7 @@ export class Reader {
   }
 
   /** One JSON-RPC request over Streamable HTTP, in the 2026-07-28 form: no session, the envelope in `_meta`. */
-  private async rpc(server: Server, method: string, params: { name: string } & Record<string, unknown>): Promise<unknown> {
+  private async rpc(server: Server, method: string, params: { name: string } & Record<string, unknown>, signal = this.stopping): Promise<unknown> {
     const { url, token } = server;
     const name = /^[\x20-\x7e]*$/.test(params.name) ? params.name : `=?base64?${Buffer.from(params.name).toString("base64")}?=`;
     const meta = {
@@ -372,7 +387,7 @@ export class Reader {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: ++this.rpcId, method, params: { ...params, _meta: meta } }),
-      signal: this.stopping,
+      signal,
     });
     const text = await res.text();
     const json = text.trimStart().startsWith("{") ? text : (text.split("\n").find((line) => line.startsWith("data: "))?.slice(6) ?? "");

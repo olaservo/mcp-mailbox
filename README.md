@@ -87,6 +87,7 @@ With `READER_SERVERS_DIR` set, the reader subscribes to every server that has a 
 With `READER_POLL_PORT` set, the reader answers `events/list` and `events/poll` as JSON-RPC POSTs on that port, on any path. A client that polls and has no webhook support can then follow a server through the mailbox. For the `mcp-events` Claude Code mod in forge-mcp-server, set its `url` option to `http://127.0.0.1:<port>/mcp`.
 
 - Events are kept in memory, the newest 1000. A poll with no cursor starts from now. A cursor from before a restart of the reader polls as `truncated`.
+- On either of those polls the reader also sends each server a poll with no cursor for that event, and returns what they answer. A server that keeps an ask waiting can give it to a client that starts late this way, as forge-mcp-server does from `5933c34`. The answers are not verified by signature, since they come from the server itself and not through the mailbox.
 - `maxAgeMs` and `maxEvents` are honoured. `nextPollMs` is 1000.
 - There is no authentication. It listens on loopback and refuses a request with an `Origin` header.
 - The client's tool calls still go to the MCP server itself. Only events take this path.
@@ -156,6 +157,8 @@ Two more games the same day, on LEGION7 through the deployed mailbox, with count
 
 - After a restart of the server on port 3080 (reader at `f4d9ad1`, refresh every minute): the reader subscribed to the new process 7 seconds after it started, having been retrying every 15 seconds while the port was down. The server then emitted 163 events and logged 163 deliveries, all 200 on the first attempt. The reader logged no skip. No ask was pending at the restart, so the server's replay of one was not exercised.
 - With two servers (reader at `8a46e9e`, forge-mcp-server `bcd8437`): a stand-in held port 3080 and the playing session's server took a free port. The reader found it in the registry and subscribed 4 seconds after it started. That server emitted 118 events and logged 118 deliveries, all 200 on the first attempt. The reader's state holds 118 handled deliveries from it and its cursor reads 118. The mod, with `relay` on, started turns in that session from the reader's endpoint. The stand-in emitted nothing, so two servers did not send events at the same time.
+
+The first-poll request, 2026-11-22: accepted by forge-mcp-server's HTTP endpoint at `59864fd`, which answered with no events. Not run against `5933c34`, the build that answers with the waiting ask.
 
 Not tested: two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
 

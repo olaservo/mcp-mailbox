@@ -47,9 +47,9 @@ function exec(commandLine: string, received: Received): Promise<void> {
 }
 
 const events = env.READER_EVENTS!.split(",").map((name) => name.trim()).filter(Boolean);
-const endpoint = env.READER_POLL_PORT ? new PollEndpoint(events) : undefined;
+const endpoint = env.READER_POLL_PORT ? new PollEndpoint(events, (name) => reader.pending(name)) : undefined;
 
-const reader = new Reader({
+const reader: Reader = new Reader({
   mailbox: { url: env.MAILBOX_URL!, key: env.MAILBOX_KEY! },
   server: env.READER_SERVER_URL ? { url: env.READER_SERVER_URL, token: env.READER_SERVER_TOKEN } : undefined,
   servers: env.READER_SERVERS_DIR ? { dir: env.READER_SERVERS_DIR, token: env.READER_SERVER_TOKEN } : undefined,

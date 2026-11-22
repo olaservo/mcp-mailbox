@@ -36,12 +36,15 @@ interface Subscribed {
 async function fakeServer() {
   const subscribed: Subscribed[] = [];
   const unsubscribed: string[] = [];
+  /** What `events/poll` answers. */
+  const waiting: object[] = [];
   const http = createServer((req, res) => {
     let text = "";
     req.on("data", (chunk) => (text += chunk));
     req.on("end", async () => {
       const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; cursor: string | null; delivery: { url: string; secret: string } } };
       const reply = (body: object) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
+      if (method === "events/poll") return reply({ result: { events: params.cursor === null ? waiting : [], cursor: "c:0", truncated: false } });
       if (method === "events/unsubscribe") {
         unsubscribed.push(params.name);
         return reply({ result: {} });
@@ -61,6 +64,7 @@ async function fakeServer() {
     url: `http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`,
     subscribed,
     unsubscribed,
+    waiting,
     close: () => new Promise<void>((resolve) => { http.closeAllConnections(); http.close(() => resolve()); }),
   };
 }
@@ -268,7 +272,7 @@ test("unsubscribe tells the server and removes the hook", async () => {
 });
 
 test("a polling client gets the reader's events from the poll endpoint", async () => {
-  const endpoint = new PollEndpoint(["a.moved", "a.chat"]);
+  const endpoint: PollEndpoint = new PollEndpoint(["a.moved", "a.chat"], (name) => reader.pending(name));
   const { reader, sub } = setUp(["a.moved", "a.chat"], { handle: ({ event }) => endpoint.add(event) });
   const served = await endpoint.listen(0);
   // The request the mcp-events mod sends.
@@ -305,6 +309,19 @@ test("a polling client gets the reader's events from the poll endpoint", async (
     const aged = await poll("a.moved", start.cursor, { maxAgeMs: 10 });
     assert.deepEqual([aged.events, aged.truncated], [[], true], "events older than maxAgeMs are reported as a gap");
     assert.equal((await poll("a.moved", "00000000:1")).truncated, true, "a cursor from another run");
+
+    // A client that starts to follow is given what the server says is waiting. One with a cursor is not.
+    const ask = { eventId: "ep-9", name: "a.moved", timestamp: new Date().toISOString(), data: { waiting: true } };
+    server.waiting.push(ask, { ...ask, name: "a.other" });
+    try {
+      assert.deepEqual((await poll("a.moved", null)).events, [ask]);
+      const stale = await poll("a.moved", "00000000:1");
+      assert.deepEqual([stale.events, stale.truncated], [[ask], true]);
+      assert.deepEqual((await poll("a.chat", null)).events, [], "an event of another name is left out");
+      assert.deepEqual((await poll("a.moved", two.cursor)).events, []);
+    } finally {
+      server.waiting.length = 0;
+    }
     assert.equal((await rpc("events/poll", { name: "a.other", cursor: null })).error?.code, -32602);
     assert.equal((await rpc("events/subscribe", { name: "a.moved" })).error?.code, -32601);
     assert.equal((await rpc("events/list", {}, { origin: "https://example.com" })).status, 403);

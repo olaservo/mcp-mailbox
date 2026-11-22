@@ -25,17 +25,20 @@ class RpcError extends Error {
 /**
  * Serves the reader's events as SEP-3415 poll delivery (`events/list`, `events/poll`), for a client that
  * polls and has no webhook support. The events are kept in memory. Cursors are `<epoch>:<seq>` and the
- * epoch is per process, so a cursor from before a restart polls as `truncated`.
+ * epoch is per process, so a cursor from before a restart polls as `truncated`. A client with no cursor, or one
+ * that cannot be used, is given what `pending` returns: what the servers say is still waiting.
  */
 export class PollEndpoint {
   private readonly names: string[];
+  private readonly pending: (name: string) => Promise<EventBody[]>;
   private readonly capacity: number;
   private readonly epoch = randomUUID().slice(0, 8);
   private readonly entries: { seq: number; event: EventBody }[] = [];
   private seq = 0;
 
-  constructor(names: string[], capacity = 1000) {
+  constructor(names: string[], pending: (name: string) => Promise<EventBody[]> = async () => [], capacity = 1000) {
     this.names = names;
+    this.pending = pending;
     this.capacity = capacity;
   }
 
@@ -47,20 +50,20 @@ export class PollEndpoint {
   }
 
   /** The result of one request, or an `RpcError`. */
-  call(method: string, params: PollParams = {}): unknown {
+  async call(method: string, params: PollParams = {}): Promise<unknown> {
     if (method === "events/list") return { events: this.names.map((name) => ({ name, delivery: ["poll"] })) };
     if (method !== "events/poll") throw new RpcError(METHOD_NOT_FOUND, `${method} is not served here`);
     const { name, cursor } = params;
     if (typeof name !== "string" || !this.names.includes(name)) throw new RpcError(INVALID_PARAMS, `unknown event ${String(name)}`);
     const head = `${this.epoch}:${this.seq}`;
-    const fresh = { events: [], cursor: head, hasMore: false, nextPollMs: POLL_MS };
+    const starting = () => ({ events: [] as EventBody[], cursor: head, hasMore: false, nextPollMs: POLL_MS });
     // No cursor: the client starts from now.
-    if (cursor == null) return { ...fresh, truncated: false };
+    if (cursor == null) return { ...starting(), events: await this.pending(name), truncated: false };
 
     const [epoch, raw] = String(cursor).split(":");
     const from = Number(raw);
     const oldest = this.entries[0]?.seq ?? this.seq + 1;
-    if (epoch !== this.epoch || !Number.isInteger(from) || from > this.seq || from < oldest - 1) return { ...fresh, truncated: true };
+    if (epoch !== this.epoch || !Number.isInteger(from) || from > this.seq || from < oldest - 1) return { ...starting(), events: await this.pending(name), truncated: true };
 
     const floor = typeof params.maxAgeMs === "number" ? Date.now() - params.maxAgeMs : -Infinity;
     const since = this.entries.filter((e) => e.seq > from && e.event.name === name);
@@ -84,12 +87,12 @@ export class PollEndpoint {
       if (req.method !== "POST" || req.headers.origin !== undefined) return reply(403, { error: "POST from a local client only" });
       let text = "";
       req.on("data", (chunk) => (text += chunk));
-      req.on("end", () => {
+      req.on("end", async () => {
         let id: unknown = null;
         try {
           const message = JSON.parse(text) as { id?: unknown; method?: unknown; params?: PollParams };
           id = message.id ?? null;
-          reply(200, { jsonrpc: "2.0", id, result: this.call(String(message.method), message.params) });
+          reply(200, { jsonrpc: "2.0", id, result: await this.call(String(message.method), message.params) });
         } catch (err) {
           const code = err instanceof RpcError ? err.code : -32700;
           reply(200, { jsonrpc: "2.0", id, error: { code, message: (err as Error).message } });
