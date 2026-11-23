@@ -93,11 +93,82 @@ test("a waiting fetch returns empty when nothing arrives", async () => {
   assert.ok(Date.now() - started >= 900);
 });
 
-test("a deleted hook stops accepting deliveries", async () => {
+test("a deleted hook stops accepting deliveries, and its deliveries go with it", async () => {
   const hook = await mailbox.createHook("gone");
+  const tip = await mailbox.tip();
+  assert.equal((await post(hook.url, "left behind")).status, 200);
   assert.equal((await mailbox.deleteHook(hook.token)).status, 200);
   assert.equal((await post(hook.url, "{}")).status, 404);
   assert.equal((await mailbox.deleteHook(hook.token)).status, 404);
+  assert.deepEqual((await mailbox.deliveries(tip)).filter((d) => d.hook === hook.token), []);
+});
+
+test("a waiting fetch for one hook is not woken by another hook's delivery", async () => {
+  const mine = await mailbox.createHook("mine");
+  const other = await mailbox.createHook("other");
+  const tip = await mailbox.tip();
+  const started = Date.now();
+  const waiting = mailbox.deliveries(tip, `&wait=2&hook=${mine.token}`);
+  setTimeout(() => void post(other.url, "not yours"), 300);
+  assert.deepEqual(await waiting, []);
+  assert.ok(Date.now() - started >= 1900, `returned after ${Date.now() - started} ms`);
+  const late = mailbox.deliveries(tip, `&wait=10&hook=${mine.token}`);
+  setTimeout(() => void post(mine.url, "yours"), 300);
+  assert.equal((await late).length, 1);
+  await mailbox.deleteHook(mine.token);
+  await mailbox.deleteHook(other.token);
+});
+
+test("a hook at its own limit answers 503 and the others still accept", async (t) => {
+  if (target.remote) return t.skip("needs a small limit, set only on the in-memory mailbox");
+  const small = await startMailbox({ maxPerHook: 2 });
+  try {
+    const own = reader(small);
+    const stuck = await own.createHook("stuck");
+    const live = await own.createHook("live");
+    assert.equal((await post(stuck.url, "1")).status, 200);
+    assert.equal((await post(stuck.url, "2")).status, 200);
+    const refused = await post(stuck.url, "3");
+    assert.equal(refused.status, 503);
+    assert.deepEqual(await refused.json(), { error: "hook full" });
+    assert.equal((await post(live.url, "a")).status, 200);
+    await own.ack(1, stuck.token);
+    assert.equal((await post(stuck.url, "3")).status, 200);
+  } finally {
+    await small.close();
+  }
+});
+
+test("a hook with idleSeconds is removed with its deliveries when not fetched for that long, and one without is kept", async (t) => {
+  if (target.remote) return t.skip("needs a clock the test can move, set only on the in-memory mailbox");
+  let clock = 1_000_000;
+  const timed = await startMailbox({ now: () => clock });
+  try {
+    const own = reader(timed);
+    const session = await own.createHook("session", 60);
+    const kept = await own.createHook("reader");
+    assert.equal((await post(session.url, "unread")).status, 200);
+    clock += 50_000;
+    await own.deliveries(0, `&hook=${session.token}`); // a fetch counts as a read
+    clock += 50_000;
+    assert.equal((await post(session.url, "still here")).status, 200);
+    clock += 61_000;
+    assert.equal((await post(kept.url, "x")).status, 200); // any request sweeps
+    assert.equal((await post(session.url, "late")).status, 404);
+    const left = await own.deliveries(0);
+    assert.deepEqual(left.map((d) => d.hook), [kept.token]);
+    clock += 8 * 24 * 3600_000;
+    assert.equal((await post(kept.url, "y")).status, 200);
+  } finally {
+    await timed.close();
+  }
+});
+
+test("idleSeconds outside 60 seconds to 7 days is refused", async () => {
+  for (const idleSeconds of [59, 7 * 24 * 3600 + 1, 1.5, "60"]) {
+    const res = await fetch(`${target.base}/hooks`, { method: "POST", headers: { authorization: `Bearer ${target.key}` }, body: JSON.stringify({ idleSeconds }) });
+    assert.equal(res.status, 400, `idleSeconds ${JSON.stringify(idleSeconds)}`);
+  }
 });
 
 test("a full mailbox answers 503 until the reader acks", async (t) => {

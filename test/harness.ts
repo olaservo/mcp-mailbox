@@ -14,12 +14,13 @@ export interface Target {
 }
 
 /** MAILBOX_URL and MAILBOX_KEY point the tests at a running mailbox. Without them, one starts here in memory. */
-export async function startMailbox(opts: { maxStored?: number } = {}): Promise<Target> {
+export async function startMailbox(opts: { maxStored?: number; maxPerHook?: number; now?: () => number } = {}): Promise<Target> {
   if (process.env.MAILBOX_URL) {
     return { base: process.env.MAILBOX_URL.replace(/\/$/, ""), key: process.env.MAILBOX_KEY ?? "", remote: true, close: async () => {} };
   }
   const key = randomBytes(32).toString("base64url");
   const store = new MemoryStore(opts);
+  const now = opts.now;
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -30,7 +31,7 @@ export async function startMailbox(opts: { maxStored?: number } = {}): Promise<T
       }
       const hasBody = req.method !== "GET" && req.method !== "HEAD";
       const request = new Request(`http://${req.headers.host}${req.url}`, { method: req.method, headers, body: hasBody ? Buffer.concat(chunks) : undefined });
-      const response = await handle(request, store, { key });
+      const response = await handle(request, store, { key, now });
       res.writeHead(response.status, Object.fromEntries(response.headers));
       res.end(Buffer.from(await response.arrayBuffer()));
     });
@@ -51,8 +52,8 @@ export type { Fetched };
 export function reader(target: Target) {
   const auth = { authorization: `Bearer ${target.key}` };
   return {
-    async createHook(label = ""): Promise<{ token: string; url: string }> {
-      const res = await fetch(`${target.base}/hooks`, { method: "POST", headers: auth, body: JSON.stringify({ label }) });
+    async createHook(label = "", idleSeconds?: number): Promise<{ token: string; url: string }> {
+      const res = await fetch(`${target.base}/hooks`, { method: "POST", headers: auth, body: JSON.stringify({ label, idleSeconds }) });
       if (res.status !== 201) throw new Error(`create hook: ${res.status}`);
       return (await res.json()) as { token: string; url: string };
     },

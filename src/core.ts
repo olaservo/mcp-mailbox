@@ -7,7 +7,10 @@
 
 export const MAX_BODY_BYTES = 256 * 1024;
 export const MAX_STORED = 10_000;
+export const MAX_PER_HOOK = 2_000;
 export const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_IDLE_SECONDS = 60;
+const MAX_IDLE_SECONDS = RETENTION_MS / 1000;
 const MAX_VERIFICATION_BYTES = 4096;
 const MAX_FETCH = 500;
 const MAX_WAIT_MS = 25_000;
@@ -21,6 +24,10 @@ export interface Hook {
   token: string;
   label: string;
   createdAt: number;
+  /** Epoch ms of the last fetch for this hook, or its creation. */
+  lastReadAt: number;
+  /** A hook not fetched for this long is removed with its deliveries. Absent: it is kept. */
+  idleSeconds?: number;
 }
 
 export interface Delivery {
@@ -34,14 +41,21 @@ export interface Delivery {
 }
 
 export interface Store {
-  createHook(token: string, label: string, now: number): Promise<void>;
+  createHook(token: string, label: string, now: number, idleSeconds?: number): Promise<void>;
+  /** Removes the hook and its deliveries. */
   deleteHook(token: string): Promise<boolean>;
   hasHook(token: string): Promise<boolean>;
   listHooks(): Promise<Hook[]>;
-  /** Stores a delivery and returns its sequence number. Also drops deliveries older than `RETENTION_MS`. */
-  insert(token: string, receivedAt: number, headers: Record<string, string>, body: Uint8Array): Promise<number | "unknown" | "full">;
-  /** Deliveries with `seq > after`, oldest first, for one hook when `hook` is given. With none and `waitMs > 0`, waits up to that long for one. */
-  list(after: number, limit: number, waitMs: number, hook?: string): Promise<Delivery[]>;
+  /**
+   * Stores a delivery and returns its sequence number. Also drops deliveries older than `RETENTION_MS` and hooks
+   * idle past their `idleSeconds`. "full" when `MAX_STORED` are held, "hook full" when `MAX_PER_HOOK` are held for this hook.
+   */
+  insert(token: string, receivedAt: number, headers: Record<string, string>, body: Uint8Array): Promise<number | "unknown" | "full" | "hook full">;
+  /**
+   * Deliveries with `seq > after`, oldest first, for one hook when `hook` is given. With none and `waitMs > 0`, waits up to
+   * that long for one. With `hook`, records the read and wakes only for that hook's deliveries.
+   */
+  list(after: number, limit: number, waitMs: number, hook: string | undefined, now: number): Promise<Delivery[]>;
   /** Deletes deliveries with `seq <= upTo`, for one hook when `hook` is given. Returns how many. */
   ack(upTo: number, hook?: string): Promise<number>;
 }
@@ -52,23 +66,26 @@ export interface MailboxOptions {
   now?: () => number;
 }
 
-/** Lets a `list` call wait for the next `insert`. */
+/** Lets a `list` call wait for the next `insert`, for one hook or for any. */
 export class Waiters {
-  private readonly waiting = new Set<() => void>();
+  private readonly waiting = new Set<{ hook: string | undefined; done: () => void }>();
 
-  wake(): void {
-    for (const done of [...this.waiting]) done();
+  wake(hook: string): void {
+    for (const waiter of [...this.waiting]) if (waiter.hook === undefined || waiter.hook === hook) waiter.done();
   }
 
-  wait(ms: number): Promise<void> {
+  wait(ms: number, hook?: string): Promise<void> {
     return new Promise((resolve) => {
-      const done = () => {
-        clearTimeout(timer);
-        this.waiting.delete(done);
-        resolve();
+      const waiter = {
+        hook,
+        done: () => {
+          clearTimeout(timer);
+          this.waiting.delete(waiter);
+          resolve();
+        },
       };
-      const timer = setTimeout(done, ms);
-      this.waiting.add(done);
+      const timer = setTimeout(waiter.done, ms);
+      this.waiting.add(waiter);
     });
   }
 }
@@ -135,6 +152,7 @@ async function receive(request: Request, store: Store, token: string, receivedAt
   const seq = await store.insert(token, receivedAt, headers, body);
   if (seq === "unknown") return error(404, "not found");
   if (seq === "full") return error(503, "mailbox full");
+  if (seq === "hook full") return error(503, "hook full");
   return json(200, { seq });
 }
 
@@ -158,11 +176,15 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
 
   switch (route) {
     case "POST /hooks": {
-      const input = (await request.json().catch(() => ({}))) as { label?: unknown } | null;
+      const input = (await request.json().catch(() => ({}))) as { label?: unknown; idleSeconds?: unknown } | null;
       const label = typeof input?.label === "string" ? input.label.slice(0, 200) : "";
+      const idleSeconds = input?.idleSeconds;
+      if (idleSeconds !== undefined && (!Number.isSafeInteger(idleSeconds) || (idleSeconds as number) < MIN_IDLE_SECONDS || (idleSeconds as number) > MAX_IDLE_SECONDS)) {
+        return error(400, `idleSeconds is a whole number from ${MIN_IDLE_SECONDS} to ${MAX_IDLE_SECONDS}`);
+      }
       const created = newToken();
-      await store.createHook(created, label, now);
-      return json(201, { token: created, url: `${url.origin}/hooks/${created}`, label });
+      await store.createHook(created, label, now, idleSeconds as number | undefined);
+      return json(201, { token: created, url: `${url.origin}/hooks/${created}`, label, ...(idleSeconds !== undefined ? { idleSeconds } : {}) });
     }
     case "GET /hooks":
       return json(200, { hooks: await store.listHooks() });
@@ -175,7 +197,7 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
       if (after === undefined || limit === undefined || wait === undefined) return error(400, "after, limit and wait are whole numbers");
       const hook = url.searchParams.get("hook") ?? undefined;
       if (hook !== undefined && !TOKEN.test(hook)) return error(400, "hook is a hook token");
-      const deliveries = await store.list(after, Math.max(1, limit), wait * 1000, hook);
+      const deliveries = await store.list(after, Math.max(1, limit), wait * 1000, hook, now);
       return json(200, { deliveries: deliveries.map((d) => ({ ...d, body: base64(d.body) })) });
     }
     default: {

@@ -27,11 +27,11 @@ Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
 
 | Route | Who | What |
 |---|---|---|
-| `POST /hooks` with optional `{"label"}` | reader | Creates a callback path. Returns `{token, url, label}`. Use `url` as `delivery.url` in `events/subscribe`. |
-| `GET /hooks` | reader | Lists callback paths. |
-| `DELETE /hooks/<token>` | reader | Removes a path. Later POSTs to it get 404. |
-| `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held. |
-| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `wait` (up to 25) holds the request until one arrives. `hook` limits the answer to one callback path. |
+| `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, label}`, and `idleSeconds` when given. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. |
+| `GET /hooks` | reader | Lists callback paths with `createdAt`, `lastReadAt` and `idleSeconds`. |
+| `DELETE /hooks/<token>` | reader | Removes a path and its deliveries. Later POSTs to it get 404. |
+| `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held in all, or 2,000 for this path. |
+| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `wait` (up to 25) holds the request until one arrives. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. |
 | `POST /ack` with `{"upTo": <seq>, "hook": <token>}` | reader | Deletes deliveries up to `seq`, for one callback path when `hook` is given. |
 
 Deliveries not acked are dropped after 7 days.
@@ -159,6 +159,8 @@ Two more games the same day, on LEGION7 through the deployed mailbox, with count
 - With two servers (reader at `8a46e9e`, forge-mcp-server `bcd8437`): a stand-in held port 3080 and the playing session's server took a free port. The reader found it in the registry and subscribed 4 seconds after it started. That server emitted 118 events and logged 118 deliveries, all 200 on the first attempt. The reader's state holds 118 handled deliveries from it and its cursor reads 118. The mod, with `relay` on, started turns in that session from the reader's endpoint. The stand-in emitted nothing, so two servers did not send events at the same time.
 
 The first-poll request, 2026-11-22: accepted by forge-mcp-server's HTTP endpoint at `59864fd`, which answered with no events. Not run against `5933c34`, the build that answers with the waiting ask.
+
+Per-path limits, 2026-11-23, branch `hook-limits`, not deployed: the mailbox tests pass in memory, and those that do not need a small limit or a movable clock pass under `wrangler dev`. Under `wrangler dev`, a hook and delivery written by the `main` Worker were read by this one with `lastReadAt` set and no `idleSeconds`, and the hook still accepted a POST. A hook with `idleSeconds: 60` and not fetched for 62 seconds was removed with its delivery at the next request, and a hook without it was kept.
 
 Not tested: two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
 
