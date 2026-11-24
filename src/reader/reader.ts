@@ -42,6 +42,8 @@ export interface ReaderOptions {
   /** Called with each event, one at a time, in order. */
   handle: (received: Received) => Promise<void> | void;
   label?: string;
+  /** Passed as `idleSeconds` when the hook is created, so the mailbox removes it after that long unread. Unset: kept. */
+  hookIdleSeconds?: number;
   /** How long one fetch waits at the mailbox, up to 25. */
   waitSeconds?: number;
   /** After a fetch returns deliveries, fetch again after this long, so events sent together are ordered together. */
@@ -349,7 +351,7 @@ export class Reader {
       if (hooks.some((h) => h.token === held.token)) return held;
       this.log("the mailbox no longer has the hook; creating another");
     }
-    const created = (await (await this.mailbox("POST", "/hooks", { label: this.opts.label ?? "reader" })).json()) as { token: string; url: string };
+    const created = (await (await this.mailbox("POST", "/hooks", { label: this.opts.label ?? "reader", idleSeconds: this.opts.hookIdleSeconds })).json()) as { token: string; url: string };
     this.state.hook = { token: created.token, url: created.url };
     for (const server of Object.values(this.state.servers)) server.subscriptions = {};
     this.save();

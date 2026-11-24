@@ -117,6 +117,8 @@ npm run typecheck
 MAILBOX_URL=http://127.0.0.1:8917 MAILBOX_KEY=<the key> npm test
 ```
 
+Hooks the tests make on a remote mailbox have `idleSeconds` 3600, so the mailbox removes them an hour after their last fetch. Some tests ack without `hook`, which deletes every hook's deliveries up to that point. Do not run them against a mailbox a reader is using.
+
 `FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs that server's `WebhookHub` through the mailbox.
 
 ## Deploy

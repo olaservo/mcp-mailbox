@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { Reader, type Received } from "../src/reader/reader.ts";
 import { signatureOk } from "../src/reader/verify.ts";
-import { reader, startMailbox } from "./harness.ts";
+import { reader, startMailbox, TEST_HOOK_IDLE_SECONDS } from "./harness.ts";
 
 // Runs forge-mcp-server's WebhookHub against the mailbox. Set FORGE_MCP_SERVER to a built clone.
 const repo = process.env.FORGE_MCP_SERVER;
@@ -70,6 +70,7 @@ test("the reader subscribes to forge-mcp-server over HTTP and hands on its event
     events: ["forge.your_move", "forge.chat"],
     stateFile: join(mkdtempSync(join(tmpdir(), "reader-forge-")), "state.json"),
     label: "forge test",
+    hookIdleSeconds: TEST_HOOK_IDLE_SECONDS,
     handle: (received) => void got.push(received),
     log: (line) => lines.push(line),
   });

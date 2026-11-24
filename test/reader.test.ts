@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { PollEndpoint } from "../src/reader/poll-endpoint.ts";
 import { Reader, type Received, type ReaderOptions } from "../src/reader/reader.ts";
-import { reader as mailboxClient, startMailbox, type Target } from "./harness.ts";
+import { reader as mailboxClient, startMailbox, TEST_HOOK_IDLE_SECONDS, type Target } from "./harness.ts";
 
 let target: Target;
 let server: Awaited<ReturnType<typeof fakeServer>>;
@@ -101,6 +101,7 @@ function setUp(events: string[], extra: Partial<ReaderOptions> = {}) {
     events,
     stateFile: join(mkdtempSync(join(tmpdir(), "reader-")), "state.json"),
     settleMs: 50,
+    hookIdleSeconds: TEST_HOOK_IDLE_SECONDS,
     handle: (received) => void got.push(received),
     log: (line) => lines.push(line),
     ...extra,

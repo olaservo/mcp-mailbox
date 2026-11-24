@@ -46,13 +46,16 @@ export async function startMailbox(opts: { maxStored?: number; maxPerHook?: numb
   };
 }
 
+/** Hooks made by a run against a remote mailbox are removed this long after their last fetch. */
+export const TEST_HOOK_IDLE_SECONDS = 3600;
+
 export type { Fetched };
 
 /** The reader's side of the mailbox API. */
 export function reader(target: Target) {
   const auth = { authorization: `Bearer ${target.key}` };
   return {
-    async createHook(label = "", idleSeconds?: number): Promise<{ token: string; url: string }> {
+    async createHook(label = "", idleSeconds = target.remote ? TEST_HOOK_IDLE_SECONDS : undefined): Promise<{ token: string; url: string }> {
       const res = await fetch(`${target.base}/hooks`, { method: "POST", headers: auth, body: JSON.stringify({ label, idleSeconds }) });
       if (res.status !== 201) throw new Error(`create hook: ${res.status}`);
       return (await res.json()) as { token: string; url: string };
