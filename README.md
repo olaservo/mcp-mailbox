@@ -151,9 +151,9 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 
 ## Tested
 
-- Mailbox, 2026-11-21: the tests pass in memory, under `wrangler dev` and against the deployed Worker. forge-mcp-server's webhook hub passes its verification handshake against the mailbox with its `https` and public-address checks on, and its deliveries verify with the reader's secret.
-- Reader, 2026-11-21: the tests pass in memory and under `wrangler dev`. Against forge-mcp-server's HTTP endpoint, events emitted in order are handed on in order. The `mcp-events` mod's code, run in Node against the poll endpoint, submitted an event between turns once and held events during a turn.
-- Games, 2026-11-22 and 23, through the deployed mailbox: four games in which the server logged a successful delivery for every event it emitted (156, 163, 118 and 108). After a server restart the reader subscribed to the new process 7 seconds later. With two servers registered, the reader found the session's server on a free port and its events started turns in that session. Before the refresh was shortened to a minute, four events emitted during a restart were lost, the coin-toss ask among them.
-- Per-path limits, 2026-11-23: the tests pass in memory and under `wrangler dev`. A hook and delivery written by the previous Worker survived the schema change. Deployed as version `2a248489`. The Durable Object took the new code 5 minutes after the deploy, since an active object adopts it up to 300 seconds late.
+- The tests pass in memory, under `wrangler dev` and against the deployed Worker.
+- Endpoint verification: forge-mcp-server's handshake passes against the mailbox with its `https` and public-address checks on. From 0.3.0 it reads the well-known document and sends no challenge, and the games on 2026-11-24 ran 0.3.1.
+- Games, 2026-11-22 to 24, through the deployed mailbox: seven games with every event the server emitted delivered (156, 163, 118, 108, 96, 136 and 102). In the last three the reader handed on every event once, with no gaps in the event ids. A poll with no cursor returned each pending ask once (23 asks). After a server restart the reader subscribed to the new process 7 seconds later.
+- A Worker deploy reaches an active Durable Object up to 5 minutes late. Observed on 2026-11-23.
 
-Not tested: two servers emitting during the same game, a server restart with an ask pending, a poll with no cursor while an ask is pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
+Not tested: two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
