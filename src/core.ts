@@ -16,6 +16,7 @@ const MAX_FETCH = 500;
 const MAX_WAIT_MS = 25_000;
 const MIN_KEY_LENGTH = 32;
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const RECEIVER_DOCUMENT = "/.well-known/mcp-webhook-receiver.json";
 
 /** Headers kept with each delivery. The reader needs them to verify. */
 const KEPT_HEADERS = ["content-type", "webhook-id", "webhook-timestamp", "webhook-signature", "x-mcp-subscription-id"];
@@ -153,6 +154,10 @@ async function receive(request: Request, store: Store, token: string, receivedAt
 export async function handle(request: Request, store: Store, opts: MailboxOptions): Promise<Response> {
   const now = (opts.now ?? Date.now)();
   const url = new URL(request.url);
+  // SEP-3415 endpoint verification, option 4: the origin consents to deliveries under /hooks/.
+  if (request.method === "GET" && url.pathname === RECEIVER_DOCUMENT) {
+    return Response.json({ receivers: ["/hooks/"] }, { headers: { "cache-control": "public, max-age=3600" } });
+  }
   const parts = url.pathname.split("/").filter(Boolean);
   const route = `${request.method} /${parts[0] ?? ""}${parts.length > 1 ? "/:token" : ""}`;
   if (parts.length > 2) return error(404, "not found");

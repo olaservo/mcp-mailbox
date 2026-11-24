@@ -25,7 +25,7 @@ The relay can still read events, drop them, and hand an old one out again. A cli
 - check that the event name in the signed body matches the subscription, since the subscription id header is not signed;
 - order events by their content. Observed with forge-mcp-server: it POSTs events concurrently, and four events emitted in order arrived in another order.
 
-Where the mailbox departs from the SEP: it echoes the verification challenge for any registered path without checking a signature. The SEP says the receiver verifies before echoing. The mailbox has no secret to verify with, and registering the path is the consent.
+Endpoint verification: the mailbox serves `/.well-known/mcp-webhook-receiver.json` with `{"receivers": ["/hooks/"]}`, the SEP's option for a gateway that fronts many subscriptions. A server that supports it treats every hook URL as verified without a challenge. A server that only does the verification handshake still gets an echo for any registered path, without a signature check, since the mailbox has no secret. The SEP says the receiver verifies before echoing, so this part departs from it. Either way, anyone who has a hook URL can point a server at it, and the reader refuses what it receives. Those deliveries still count toward the hook's limit of 2,000.
 
 Where the SEP leaves a gap:
 
@@ -48,6 +48,7 @@ Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
 | `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, label}`, and `idleSeconds` when given. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. |
 | `GET /hooks` | reader | Lists callback paths with `createdAt`, `lastReadAt` and `idleSeconds`. |
 | `DELETE /hooks/<token>` | reader | Removes a path and its deliveries. Later POSTs to it get 404. |
+| `GET /.well-known/mcp-webhook-receiver.json` | MCP server | `{"receivers": ["/hooks/"]}`, so a server that supports SEP-3415's well-known option skips the challenge. No key. |
 | `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held in all, or 2,000 for this path. |
 | `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `wait` (up to 25) holds the request until one arrives. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. |
 | `POST /ack` with `{"upTo": <seq>, "hook": <token>}` | reader | Deletes deliveries up to `seq`, for one callback path when `hook` is given. |

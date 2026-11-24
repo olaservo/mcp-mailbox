@@ -23,6 +23,12 @@ test("reader routes need the key", async () => {
   }
 });
 
+test("the well-known receiver document covers /hooks/ and needs no key", async () => {
+  const res = await fetch(`${target.base}/.well-known/mcp-webhook-receiver.json`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { receivers: ["/hooks/"] });
+});
+
 test("a path that was not registered is not found", async () => {
   const challenge = await post(`${target.base}/hooks/${unknownToken}`, JSON.stringify({ type: "verification", challenge: "abc" }));
   assert.equal(challenge.status, 404);
