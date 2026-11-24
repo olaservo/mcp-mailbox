@@ -2,7 +2,7 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. Encryption is not started.
+Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. The reader's half of encryption is built. It has run against forge-mcp-server in tests, and not in a game.
 
 ```
                events/subscribe (callback: hook URL, secret)
@@ -31,13 +31,13 @@ Where the SEP leaves a gap:
 
 - A server that gives up retrying loses that event, and the client is not told while its subscription stays live. The SEP says such an event can be recovered by cursor replay, and also that a cursor on the refresh of a live subscription is a no-op. The workaround is to unsubscribe and subscribe again with the saved cursor. The reader does not do this. See [ext-events#9](https://github.com/modelcontextprotocol/ext-events/issues/9).
 - The relay is the only durability between server and client. An event the server emits while the relay is down past the server's retries is lost.
-- The relay can read every event. Hiding them from it needs the server to encrypt `data` to a key the client supplies, which the SEP does not define. That part is not built here.
+- The relay can read every event. Hiding them from it needs the server to encrypt `data` to a key the client supplies, which the SEP does not define. The reader's half is built as an experiment. See [Encryption](#encryption).
 
 ## Parts
 
 - Mailbox (built): a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. It runs as a Cloudflare Worker with one SQLite Durable Object. `src/core.ts` holds the HTTP surface and does not depend on Workers.
 - Reader (built): a Node process that subscribes with a mailbox hook as the callback, fetches, verifies, deduplicates, orders and hands each event on: to stdout, a command, or a local poll endpoint. `src/reader/`. It has no dependencies.
-- Encryption (not started): the server encrypts the payload to a key the client supplies, so the mailbox cannot read events.
+- Encryption (reader's half built, off by default): the server encrypts the payload to a key the reader supplies, so the mailbox cannot read events. forge-mcp-server has the server's half after 0.3.1, not yet in a release.
 
 ## API
 
@@ -71,7 +71,8 @@ node --env-file=<file> src/reader/cli.ts unsubscribe  # unsubscribe and remove t
 | `READER_EVENTS` | Event names, comma separated, such as `forge.your_move,forge.chat`. |
 | `READER_EXEC` | A command run once per event through the shell, with the event as JSON on stdin and `MCP_EVENT_NAME`, `MCP_EVENT_ID` and `MCP_SUBSCRIPTION_ID` set. Without it, each event is one JSON line on stdout. |
 | `READER_POLL_PORT` | Serves the events as MCP Events poll delivery on `127.0.0.1:<port>`. Takes the place of `READER_EXEC`. See below. |
-| `READER_STATE` | State file, default `~/.mcp-mailbox/reader-state.json`. It holds the signing secret. |
+| `READER_ENCRYPT` | `1` asks each server to encrypt event data to the reader's key. Off by default. See below. |
+| `READER_STATE` | State file, default `~/.mcp-mailbox/reader-state.json`. It holds the signing secret and, with `READER_ENCRYPT`, the key pair. |
 | `READER_LABEL` | The hook's label in the mailbox. |
 
 What it does:
@@ -111,6 +112,20 @@ With `READER_POLL_PORT` set, the reader answers `events/list` and `events/poll` 
 - There is no authentication. It listens on loopback and refuses a request with an `Origin` header.
 - The client's tool calls still go to the MCP server itself. Only events take this path.
 
+### Encryption
+
+With `READER_ENCRYPT=1` the reader asks each server to encrypt event `data` to its key, so the mailbox holds ciphertext. SEP-3415 does not define this. It is the client half of the experiment in [forge-mcp-server#9](https://github.com/olaservo/forge-mcp-server/issues/9). forge-mcp-server has the server half on `main`, after 0.3.1 ([forge-mcp-server#24](https://github.com/olaservo/forge-mcp-server/pull/24)). 0.3.1 does not have it, so the reader does not subscribe to 0.3.1 with this set.
+
+- The scheme is `hpke-x25519-sha256-aes128gcm`: RFC 9180 base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM. `src/reader/hpke.ts` does it with Node's `crypto`, and `test/hpke-vectors.json` holds the CFRG test vectors it is checked against.
+- The reader makes one X25519 key pair on first run and keeps it in the state file as a JWK.
+- Before every subscribe it calls `events/list`. It subscribes only when each event it wants lists the scheme, as `"encryption": ["hpke-x25519-sha256-aes128gcm"]` beside `delivery`. A server without the field would accept the subscription and deliver in the clear. When a server does not list it, the reader also sends `events/unsubscribe` for what it holds there from an earlier run.
+- Every `events/subscribe` carries `delivery.encryption: {"scheme", "publicKey"}`, with the 32-byte public key in base64url. The result has to carry `delivery.encryption.scheme`. When it does not, the reader sends `events/unsubscribe` and no longer holds that subscription.
+- A delivered event has `"encrypted": {"enc", "ct"}` in base64url where `data` was. `eventId`, `name`, `timestamp` and `cursor` stay in the clear, and so do `gap` and `terminated` envelopes.
+- Each delivery is one HPKE single-shot seal. `info` is `"mcp-events v1 " + <subscription id>`, `aad` is `eventId + "\n" + name + "\n" + timestamp`, and the plaintext is the JSON of `data`.
+- The reader decrypts after the signature check. It skips a delivery that has no `encrypted` or does not decrypt. The subscription id is in `info`, so a delivery moved to another subscription does not decrypt.
+- Encryption covers the hop through the mailbox. The poll endpoint serves decrypted events, and what it asks a server directly does not pass through the mailbox.
+- Deliveries a server sent in the clear before the variable was set are skipped if the mailbox still holds them. To turn encryption off again, run `unsubscribe` first, then start without the variable. Without that the server refuses the refresh and goes on encrypting, and the reader skips those deliveries.
+
 Limits:
 
 - A handler that fails is logged and the event is not tried again.
@@ -138,7 +153,7 @@ MAILBOX_URL=http://127.0.0.1:8917 MAILBOX_KEY=<the key> npm test
 
 Hooks the tests make on a remote mailbox have `idleSeconds` 3600, so the mailbox removes them an hour after their last fetch. Some tests ack without `hook`, which deletes every hook's deliveries up to that point. Do not run them against a mailbox a reader is using.
 
-`FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs the reader against that server's HTTP endpoint and webhook hub.
+`FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs the reader against that server's HTTP endpoint and webhook hub, in the clear and encrypted. The encrypted run is skipped for a build without encryption.
 
 ## Deploy
 
@@ -156,4 +171,4 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 - Games, 2026-11-22 to 24, through the deployed mailbox: seven games with every event the server emitted delivered (156, 163, 118, 108, 96, 136 and 102). In the last three the reader handed on every event once, with no gaps in the event ids. A poll with no cursor returned each pending ask once (23 asks). After a server restart the reader subscribed to the new process 7 seconds later.
 - A Worker deploy reaches an active Durable Object up to 5 minutes late. Observed on 2026-11-23.
 
-Not tested: two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
+Not tested: encryption in a game or through the deployed mailbox, two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.

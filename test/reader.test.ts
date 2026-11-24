@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { sealSeq, setupS } from "../src/reader/hpke.ts";
 import { PollEndpoint } from "../src/reader/poll-endpoint.ts";
 import { Reader, type Received, type ReaderOptions } from "../src/reader/reader.ts";
 import { reader as mailboxClient, startMailbox, TEST_HOOK_IDLE_SECONDS, type Target } from "./harness.ts";
@@ -30,20 +31,31 @@ interface Subscribed {
   headers: Record<string, string | string[] | undefined>;
   /** The cursor the request carried. */
   cursor: string | null;
+  /** `delivery.encryption` as the request carried it. */
+  encryption?: { scheme: string; publicKey: string };
 }
 
-/** Stands in for an MCP server: answers `events/subscribe` after a challenge to the callback, and records the request. */
-async function fakeServer() {
+const SCHEME = "hpke-x25519-sha256-aes128gcm";
+
+/**
+ * Stands in for an MCP server: answers `events/subscribe` after a challenge to the callback, and records the request.
+ * With `lists` it names the encryption scheme in `events/list`, and with `echoes` in the subscribe result.
+ */
+async function fakeServer(encryption: { lists?: boolean; echoes?: boolean } = {}) {
   const subscribed: Subscribed[] = [];
   const unsubscribed: string[] = [];
+  /** The methods called, in order. */
+  const calls: string[] = [];
   /** What `events/poll` answers. */
   const waiting: object[] = [];
   const http = createServer((req, res) => {
     let text = "";
     req.on("data", (chunk) => (text += chunk));
     req.on("end", async () => {
-      const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; cursor: string | null; delivery: { url: string; secret: string } } };
+      const { id, method, params } = JSON.parse(text) as { id: number; method: string; params: { name: string; cursor: string | null; delivery: { url: string; secret: string; encryption?: Subscribed["encryption"] } } };
       const reply = (body: object) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
+      calls.push(method);
+      if (method === "events/list") return reply({ result: { events: ["a.moved", "a.chat"].map((name) => ({ name, delivery: ["webhook"], ...(encryption.lists ? { encryption: [SCHEME] } : {}) })) } });
       if (method === "events/poll") return reply({ result: { events: params.cursor === null ? waiting : [], cursor: "c:0", truncated: false } });
       if (method === "events/unsubscribe") {
         unsubscribed.push(params.name);
@@ -54,9 +66,10 @@ async function fakeServer() {
       if (((await echoed.json().catch(() => ({}))) as { challenge?: string }).challenge !== challenge) {
         return reply({ error: { code: -32027, message: "CallbackEndpointError" } });
       }
-      const sub = { id: `sub_${params.name}`, name: params.name, url: params.delivery.url, secret: params.delivery.secret, headers: req.headers, cursor: params.cursor };
+      const sub = { id: `sub_${params.name}`, name: params.name, url: params.delivery.url, secret: params.delivery.secret, headers: req.headers, cursor: params.cursor, encryption: params.delivery.encryption };
       subscribed.push(sub);
-      reply({ result: { id: sub.id, refreshBefore: new Date(Date.now() + 3600_000).toISOString(), cursor: `c:${subscribed.length}`, truncated: false } });
+      const delivery = encryption.echoes && sub.encryption ? { delivery: { encryption: { scheme: sub.encryption.scheme } } } : {};
+      reply({ result: { id: sub.id, refreshBefore: new Date(Date.now() + 3600_000).toISOString(), cursor: `c:${subscribed.length}`, truncated: false, ...delivery } });
     });
   });
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
@@ -64,6 +77,7 @@ async function fakeServer() {
     url: `http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`,
     subscribed,
     unsubscribed,
+    calls,
     waiting,
     close: () => new Promise<void>((resolve) => { http.closeAllConnections(); http.close(() => resolve()); }),
   };
@@ -76,11 +90,21 @@ interface Send {
   subscription?: string;
   /** Changes the body after signing. */
   alter?: (body: string) => string;
+  /** Sends `data` in the clear on a subscription that asked for encryption. */
+  plain?: boolean;
+}
+
+/** `data` sealed to the subscription's key, as forge-mcp-server issue 9 proposes. */
+function seal(sub: Subscribed, eventId: string, timestamp: string, data: unknown): { enc: string; ct: string } {
+  const context = setupS(1, Buffer.from(sub.encryption!.publicKey, "base64url"), Buffer.from(`mcp-events v1 ${sub.id}`));
+  const ct = sealSeq(1, context, 0, Buffer.from(`${eventId}\n${sub.name}\n${timestamp}`), Buffer.from(JSON.stringify(data)));
+  return { enc: context.enc.toString("base64url"), ct: ct.toString("base64url") };
 }
 
 /** POSTs a signed event to the subscription's callback, as the server would. */
 async function send(sub: Subscribed, eventId: string, data: unknown, opts: Send = {}): Promise<void> {
-  const body = JSON.stringify({ eventId, name: sub.name, timestamp: new Date().toISOString(), data, cursor: null });
+  const event = { eventId, name: sub.name, timestamp: new Date().toISOString() };
+  const body = JSON.stringify(sub.encryption && !opts.plain ? { ...event, cursor: null, encrypted: seal(sub, eventId, event.timestamp, data) } : { ...event, data, cursor: null });
   const timestamp = opts.timestamp ?? Math.floor(Date.now() / 1000);
   const key = Buffer.from((opts.secret ?? sub.secret).slice(6), "base64");
   const signature = createHmac("sha256", key).update(`${eventId}.${timestamp}.${body}`).digest("base64");
@@ -92,12 +116,12 @@ async function send(sub: Subscribed, eventId: string, data: unknown, opts: Send 
   assert.equal(res.status, 200);
 }
 
-function setUp(events: string[], extra: Partial<ReaderOptions> = {}) {
+function setUp(events: string[], extra: Partial<ReaderOptions> = {}, from = server) {
   const got: Received[] = [];
   const lines: string[] = [];
   const options: ReaderOptions = {
     mailbox: { url: target.base, key: target.key },
-    server: { url: server.url, token: "s3cret" },
+    server: { url: from.url, token: "s3cret" },
     events,
     stateFile: join(mkdtempSync(join(tmpdir(), "reader-")), "state.json"),
     settleMs: 50,
@@ -106,9 +130,10 @@ function setUp(events: string[], extra: Partial<ReaderOptions> = {}) {
     log: (line) => lines.push(line),
     ...extra,
   };
-  const sub = (name: string) => server.subscribed.findLast((s) => s.name === name && s.url === reader.hookUrl)!;
+  const sub = (name: string) => from.subscribed.findLast((s) => s.name === name && s.url === reader.hookUrl)!;
   const reader = new Reader(options);
-  return { reader, got, lines, options, sub, ids: () => got.map((r) => r.event.eventId) };
+  const skipped = () => lines.filter((line) => line.startsWith("skipped")).map((line) => line.split(": ")[1]);
+  return { reader, got, lines, options, sub, skipped, ids: () => got.map((r) => r.event.eventId) };
 }
 
 test("subscribes with a mailbox hook as the callback", async () => {
@@ -390,5 +415,89 @@ test("run subscribes to a server that appears in the directory, and goes on when
     stop.abort();
     await running;
     await other.close();
+  }
+});
+
+test("with encryption on, the reader sends its key at every subscribe and hands on what it decrypts", async () => {
+  const encrypting = await fakeServer({ lists: true, echoes: true });
+  const first = setUp(["a.moved"], { encrypt: true }, encrypting);
+  try {
+    await first.reader.subscribe();
+    await first.reader.subscribe();
+    assert.deepEqual(encrypting.calls, ["events/list", "events/subscribe", "events/list", "events/subscribe"]);
+    const { key } = JSON.parse(readFileSync(first.options.stateFile, "utf8")) as { key: { x: string; d: string } };
+    assert.deepEqual([key.x, key.d].map((half) => Buffer.from(half, "base64url").length), [32, 32]);
+    assert.deepEqual(encrypting.subscribed.map((s) => s.encryption), [{ scheme: SCHEME, publicKey: key.x }, { scheme: SCHEME, publicKey: key.x }]);
+
+    await send(first.sub("a.moved"), "ep-1", { n: 1 });
+    await send(first.sub("a.moved"), "ep-2", { n: 2 }, { plain: true });
+    assert.equal(await first.reader.poll(), 1);
+    assert.deepEqual(first.got.map((r) => r.event), [{ eventId: "ep-1", name: "a.moved", timestamp: first.got[0]!.event.timestamp, data: { n: 1 }, cursor: null }]);
+    assert.deepEqual(first.skipped(), ["not encrypted"]);
+
+    const second = setUp(["a.moved"], { encrypt: true, stateFile: first.options.stateFile }, encrypting);
+    await second.reader.subscribe();
+    assert.equal(second.sub("a.moved").encryption?.publicKey, key.x, "a restarted reader keeps its key");
+    await send(second.sub("a.moved"), "ep-3", { n: 3 });
+    assert.equal(await second.reader.poll(), 1);
+    assert.deepEqual(second.got.map((r) => r.event.data), [{ n: 3 }]);
+
+    // Restarted with encryption off while the server still seals.
+    const off = setUp(["a.moved"], { stateFile: first.options.stateFile }, encrypting);
+    await send(second.sub("a.moved"), "ep-4", { n: 4 });
+    assert.equal(await off.reader.poll(), 0);
+    assert.deepEqual(off.skipped(), ["encrypted, and encryption is off"]);
+  } finally {
+    await encrypting.close();
+  }
+});
+
+test("with encryption on, a server that does not list the scheme is not subscribed", async () => {
+  const plain = await fakeServer();
+  const { reader, options } = setUp(["a.moved"], { encrypt: true }, plain);
+  try {
+    await assert.rejects(reader.subscribe(), /events\/list does not list hpke-x25519-sha256-aes128gcm for a\.moved/);
+    assert.deepEqual(plain.calls, ["events/list"]);
+
+    // A subscription from a run without encryption is given up, so the server stops sending in the clear.
+    await setUp(["a.moved"], { stateFile: options.stateFile }, plain).reader.subscribe();
+    const again = setUp(["a.moved"], { encrypt: true, stateFile: options.stateFile }, plain);
+    await assert.rejects(again.reader.subscribe(), /events\/list does not list/);
+    assert.deepEqual(plain.calls.slice(1), ["events/subscribe", "events/list", "events/unsubscribe"]);
+    await send(plain.subscribed[0]!, "ep-1", {});
+    assert.equal(await again.reader.poll(), 0);
+    assert.deepEqual(again.skipped(), ["unknown subscription"]);
+  } finally {
+    await plain.close();
+  }
+});
+
+test("with encryption on, a subscribe result that does not name the scheme is refused", async () => {
+  const silent = await fakeServer({ lists: true });
+  const { reader, skipped } = setUp(["a.moved"], { encrypt: true }, silent);
+  try {
+    await assert.rejects(reader.subscribe(), /the result for a\.moved does not say hpke-x25519-sha256-aes128gcm is in effect/);
+    assert.deepEqual(silent.calls, ["events/list", "events/subscribe", "events/unsubscribe"]);
+    // What the server sent before it was unsubscribed.
+    await send(silent.subscribed[0]!, "ep-1", {}, { plain: true });
+    assert.equal(await reader.poll(), 0);
+    assert.deepEqual(skipped(), ["unknown subscription"]);
+  } finally {
+    await silent.close();
+  }
+});
+
+test("with encryption on, a delivery moved to another subscription does not decrypt", async () => {
+  const encrypting = await fakeServer({ lists: true, echoes: true });
+  const { reader, ids, skipped, sub } = setUp(["a.moved", "a.chat"], { encrypt: true }, encrypting);
+  try {
+    await reader.subscribe();
+    await send(sub("a.moved"), "ep-1", {}, { subscription: sub("a.chat").id });
+    await send(sub("a.moved"), "ep-2", {});
+    assert.equal(await reader.poll(), 1);
+    assert.deepEqual(ids(), ["ep-2"]);
+    assert.deepEqual(skipped(), ["does not decrypt"]);
+  } finally {
+    await encrypting.close();
   }
 });

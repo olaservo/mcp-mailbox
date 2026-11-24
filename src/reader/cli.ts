@@ -17,7 +17,10 @@ const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
                              Without it, each event is one JSON line on stdout.
   READER_POLL_PORT           serve the events as MCP Events poll delivery on 127.0.0.1:<port>, for a client
                              that polls. Takes the place of READER_EXEC.
-  READER_STATE               state file (default ~/.mcp-mailbox/reader-state.json). It holds the signing secret.
+  READER_ENCRYPT             1 to ask each server to encrypt event data to the reader's key, so the mailbox
+                             cannot read it. A server that cannot is not subscribed. Off by default.
+  READER_STATE               state file (default ~/.mcp-mailbox/reader-state.json). It holds the signing secret
+                             and the key pair.
   READER_LABEL               the hook's label in the mailbox`;
 
 const env = process.env;
@@ -26,6 +29,11 @@ if (!env.READER_SERVER_URL && !env.READER_SERVERS_DIR) missing.push("READER_SERV
 const command = process.argv[2] ?? "run";
 if (missing.length > 0 || !["run", "unsubscribe"].includes(command)) {
   console.error(missing.length > 0 ? `Not set: ${missing.join(", ")}\n\n${USAGE}` : USAGE);
+  process.exit(2);
+}
+// Any other value is refused, so a reader meant to encrypt does not run in the clear.
+if (!["", "0", "1"].includes(env.READER_ENCRYPT ?? "")) {
+  console.error(`READER_ENCRYPT is "${env.READER_ENCRYPT}". Set it to 1, or leave it unset.`);
   process.exit(2);
 }
 
@@ -54,6 +62,7 @@ const reader: Reader = new Reader({
   server: env.READER_SERVER_URL ? { url: env.READER_SERVER_URL, token: env.READER_SERVER_TOKEN } : undefined,
   servers: env.READER_SERVERS_DIR ? { dir: env.READER_SERVERS_DIR, token: env.READER_SERVER_TOKEN } : undefined,
   events,
+  encrypt: env.READER_ENCRYPT === "1",
   stateFile: env.READER_STATE ?? join(homedir(), ".mcp-mailbox", "reader-state.json"),
   label: env.READER_LABEL,
   log,
