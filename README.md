@@ -25,7 +25,7 @@ The relay can still read events, drop them, and hand an old one out again. A cli
 - check that the event name in the signed body matches the subscription, since the subscription id header is not signed;
 - order events by their content. Observed with forge-mcp-server: it POSTs events concurrently, and four events emitted in order arrived in another order.
 
-Endpoint verification: the mailbox serves `/.well-known/mcp-webhook-receiver.json` with `{"receivers": ["/hooks/"]}`, the SEP's option for a gateway that fronts many subscriptions. A server that supports it treats every hook URL as verified without a challenge. A server that only does the verification handshake still gets an echo for any registered path, without a signature check, since the mailbox has no secret. The SEP says the receiver verifies before echoing, so this part departs from it. Either way, anyone who has a hook URL can point a server at it, and the reader refuses what it receives. Those deliveries still count toward the hook's limit of 2,000.
+Endpoint verification: the mailbox serves `/.well-known/mcp-webhook-receiver.json` with `{"receivers": ["/hooks/"]}`, the SEP's option for a gateway that fronts many subscriptions. A server that supports it treats every hook URL as verified without a challenge. forge-mcp-server does from 0.3.0. A server that only does the verification handshake still gets an echo for any registered path, without a signature check, since the mailbox has no secret. The SEP says the receiver verifies before echoing, so this part departs from it. Either way, anyone who has a hook URL can point a server at it, and the reader refuses what it receives. Those deliveries still count toward the hook's limit of 2,000.
 
 Where the SEP leaves a gap:
 
