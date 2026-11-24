@@ -2,14 +2,14 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox is deployed at `https://mcp-mailbox.olahungerford.workers.dev`. Forge games have run through the reader on LEGION7 since 2026-11-22. Encryption is not started.
+Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. Encryption is not started.
 
 ```
                events/subscribe (callback: hook URL, secret)
   MCP server  ◀─────────────────────────────────────────────  reader
       │                                                        ▲   │
       │ POST signed event                   GET /deliveries    │   │ events/poll
-      ▼                                                        │   ▼  on 127.0.0.1:3089
+      ▼                                                        │   ▼  on 127.0.0.1:<port>
   mailbox (Worker, holds no secret)  ──────────────────────────┘  mcp-events mod
 ```
 
@@ -143,9 +143,7 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 
 - Mailbox, 2026-11-21: the tests pass in memory, under `wrangler dev` and against the deployed Worker. forge-mcp-server's webhook hub passes its verification handshake against the mailbox with its `https` and public-address checks on, and its deliveries verify with the reader's secret.
 - Reader, 2026-11-21: the tests pass in memory and under `wrangler dev`. Against forge-mcp-server's HTTP endpoint, events emitted in order are handed on in order. The `mcp-events` mod's code, run in Node against the poll endpoint, submitted an event between turns once and held events during a turn.
-- Games, 2026-11-22 and 23, on LEGION7 through the deployed mailbox: four games in which the server logged a successful delivery for every event it emitted (156, 163, 118 and 108). After a server restart the reader subscribed to the new process 7 seconds later. With two servers registered, the reader found the session's server on a free port and its events started turns in that session. Before the refresh was shortened to a minute, four events emitted during a restart were lost, the coin-toss ask among them.
+- Games, 2026-11-22 and 23, through the deployed mailbox: four games in which the server logged a successful delivery for every event it emitted (156, 163, 118 and 108). After a server restart the reader subscribed to the new process 7 seconds later. With two servers registered, the reader found the session's server on a free port and its events started turns in that session. Before the refresh was shortened to a minute, four events emitted during a restart were lost, the coin-toss ask among them.
 - Per-path limits, 2026-11-23: the tests pass in memory and under `wrangler dev`. A hook and delivery written by the previous Worker survived the schema change. Deployed as version `2a248489`. The Durable Object took the new code 5 minutes after the deploy, since an active object adopts it up to 300 seconds late.
 
 Not tested: two servers emitting during the same game, a server restart with an ask pending, a poll with no cursor while an ask is pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
-
-`spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written.
