@@ -57,7 +57,7 @@ interface State {
   hook?: { token: string; url: string };
   /** The highest mailbox sequence number handled. */
   after: number;
-  /** Per server URL: event name to the id of the subscription it granted, and to the cursor it last returned from `events/subscribe`. The cursor is sent back, so a subscription that lapsed is replayed from it. */
+  /** Per server URL and event name: the subscription id it granted and the cursor it last returned. */
   servers: Record<string, { subscriptions: Record<string, string>; cursors: Record<string, string> }>;
   /** `<subscription id> <webhook-id>` of handled deliveries, with the time of receipt. */
   seen: Record<string, number>;
@@ -66,7 +66,7 @@ interface State {
 const PROTOCOL_VERSION = "2026-07-28";
 /** Subscription lifetime asked for. */
 const TTL_MS = 60 * 60 * 1000;
-/** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart, and events emitted before it does are not delivered. */
+/** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart. */
 const REFRESH_MS = 60 * 1000;
 /** A server that could not be subscribed is tried again after this long. */
 const RETRY_MS = 15 * 1000;
@@ -406,11 +406,7 @@ export class Reader {
   private load(): State {
     const fresh: State = { secret: `whsec_${randomBytes(32).toString("base64")}`, after: 0, servers: {}, seen: {} };
     if (!existsSync(this.opts.stateFile)) return fresh;
-    const { subscriptions, cursors, ...kept } = JSON.parse(readFileSync(this.opts.stateFile, "utf8")) as Partial<State> & { subscriptions?: Record<string, string>; cursors?: Record<string, string> };
-    const state = { ...fresh, ...kept };
-    // A state file from before the reader took several servers.
-    if (subscriptions && this.opts.server && !kept.servers) state.servers[this.opts.server.url] = { subscriptions, cursors: cursors ?? {} };
-    return state;
+    return { ...fresh, ...(JSON.parse(readFileSync(this.opts.stateFile, "utf8")) as Partial<State>) };
   }
 
   private save(): void {

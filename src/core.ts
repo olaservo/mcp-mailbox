@@ -46,15 +46,9 @@ export interface Store {
   deleteHook(token: string): Promise<boolean>;
   hasHook(token: string): Promise<boolean>;
   listHooks(): Promise<Hook[]>;
-  /**
-   * Stores a delivery and returns its sequence number. Also drops deliveries older than `RETENTION_MS` and hooks
-   * idle past their `idleSeconds`. "full" when `MAX_STORED` are held, "hook full" when `MAX_PER_HOOK` are held for this hook.
-   */
+  /** Stores a delivery and returns its sequence number. Also drops old deliveries and idle hooks. */
   insert(token: string, receivedAt: number, headers: Record<string, string>, body: Uint8Array): Promise<number | "unknown" | "full" | "hook full">;
-  /**
-   * Deliveries with `seq > after`, oldest first, for one hook when `hook` is given. With none and `waitMs > 0`, waits up to
-   * that long for one. With `hook`, records the read and wakes only for that hook's deliveries.
-   */
+  /** Deliveries with `seq > after`, oldest first, for one hook when `hook` is given, which also counts as that hook's read. With none and `waitMs > 0`, waits up to that long for one. */
   list(after: number, limit: number, waitMs: number, hook: string | undefined, now: number): Promise<Delivery[]>;
   /** Deletes deliveries with `seq <= upTo`, for one hook when `hook` is given. Returns how many. */
   ack(upTo: number, hook?: string): Promise<number>;

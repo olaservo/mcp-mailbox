@@ -2,12 +2,21 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox is built and deployed at `https://mcp-mailbox.olahungerford.workers.dev` (2026-11-21). The reader is built and tested against forge-mcp-server. No game has run through it. The encryption experiment is not started.
+Status: the mailbox is deployed at `https://mcp-mailbox.olahungerford.workers.dev`. Forge games have run through the reader on LEGION7 since 2026-11-22. Encryption is not started.
+
+```
+               events/subscribe (callback: hook URL, secret)
+  MCP server  ◀─────────────────────────────────────────────  reader
+      │                                                        ▲   │
+      │ POST signed event                   GET /deliveries    │   │ events/poll
+      ▼                                                        │   ▼  on 127.0.0.1:3089
+  mailbox (Worker, holds no secret)  ──────────────────────────┘  mcp-events mod
+```
 
 ## Parts
 
 - Mailbox (built): a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. It runs as a Cloudflare Worker with one SQLite Durable Object. `src/core.ts` holds the HTTP surface and does not depend on Workers.
-- Reader (built): a Node process that subscribes with a mailbox hook as the callback, fetches, verifies, deduplicates, orders and hands each event to a command. `src/reader/`. It has no dependencies.
+- Reader (built): a Node process that subscribes with a mailbox hook as the callback, fetches, verifies, deduplicates, orders and hands each event on: to stdout, a command, or a local poll endpoint. `src/reader/`. It has no dependencies.
 - Encryption (not started): the server encrypts the payload to a key the client supplies, so the mailbox cannot read events.
 
 ## What the mailbox can and cannot do
@@ -96,7 +105,7 @@ Limits:
 
 - A handler that fails is logged and the event is not tried again.
 - Ordering holds within a batch. An event that arrives after its batch was handed on is handed on late.
-- Events a server emits after a restart and before the next refresh are not delivered, for up to a minute. A cursor from before the restart does not bring them back on forge-mcp-server, whose cursors are per process. forge-mcp-server sends a new subscription the ask that is still pending (`76c7b3f`), and can keep subscriptions across restarts in a file (`FORGE_MCP_SUBSCRIPTIONS`, not tried with the reader).
+- Events a server emits after a restart and before the next refresh, up to a minute, are not delivered. forge-mcp-server's cursors are per process, so a cursor does not bring them back. It does send a new subscription the ask that is still pending.
 - A gap the server reports (`truncated`) is logged and not passed on to the handler or the poll endpoint.
 - The secret is not rotated.
 - `gap` and `terminated` envelopes are logged and nothing else is done.
@@ -119,7 +128,7 @@ MAILBOX_URL=http://127.0.0.1:8917 MAILBOX_KEY=<the key> npm test
 
 Hooks the tests make on a remote mailbox have `idleSeconds` 3600, so the mailbox removes them an hour after their last fetch. Some tests ack without `hook`, which deletes every hook's deliveries up to that point. Do not run them against a mailbox a reader is using.
 
-`FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs that server's `WebhookHub` through the mailbox.
+`FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs the reader against that server's HTTP endpoint and webhook hub.
 
 ## Deploy
 
@@ -132,38 +141,11 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 
 ## Tested
 
-2026-11-21, with forge-mcp-server's `events-push` branch at `692526b`:
+- Mailbox, 2026-11-21: the tests pass in memory, under `wrangler dev` and against the deployed Worker. forge-mcp-server's webhook hub passes its verification handshake against the mailbox with its `https` and public-address checks on, and its deliveries verify with the reader's secret.
+- Reader, 2026-11-21: the tests pass in memory and under `wrangler dev`. Against forge-mcp-server's HTTP endpoint, events emitted in order are handed on in order. The `mcp-events` mod's code, run in Node against the poll endpoint, submitted an event between turns once and held events during a turn.
+- Games, 2026-11-22 and 23, on LEGION7 through the deployed mailbox: four games in which the server logged a successful delivery for every event it emitted (156, 163, 118 and 108). After a server restart the reader subscribed to the new process 7 seconds later. With two servers registered, the reader found the session's server on a free port and its events started turns in that session. Before the refresh was shortened to a minute, four events emitted during a restart were lost, the coin-toss ask among them.
+- Per-path limits, 2026-11-23: the tests pass in memory and under `wrangler dev`. A hook and delivery written by the previous Worker survived the schema change. Deployed as version `2a248489`. The Durable Object took the new code 5 minutes after the deploy, since an active object adopts it up to 300 seconds late.
 
-- 10 of 10 tests pass against the in-memory mailbox.
-- 9 pass against the Worker under `wrangler dev` (workerd, SQLite Durable Object). The tenth sets a storage limit and only runs in memory.
-- The same 9 pass against the deployed Worker.
-- In all three, forge-mcp-server's hub passes its verification handshake against the mailbox, and four deliveries from two subscriptions verify with the reader's secret. Against the deployed Worker the hub ran with `insecure` off, so its `https` and public-address checks applied.
+Not tested: two servers emitting during the same game, a server restart with an ask pending, a poll with no cursor while an ask is pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
 
-Reader, 2026-11-21, with forge-mcp-server checked out at `c2fa1e4` and its `dist` as built that day:
-
-- The reader tests pass against the in-memory mailbox and against the Worker under `wrangler dev`, with a stand-in MCP server.
-- With `FORGE_MCP_SERVER` set, the reader subscribes to forge-mcp-server's HTTP endpoint with a bearer token, and four events emitted in order are handed on in order. Passes in memory, under `wrangler dev` and against the deployed Worker.
-- The CLI was run once against the in-memory mailbox and forge-mcp-server, printing events and with `READER_EXEC`.
-- The CLI was run once with `READER_POLL_PORT` against the same two. Three events emitted by forge-mcp-server were read by a client polling once a second with the mod's request, 1.1 s after they were emitted. The mod's `register.ts` (forge-mcp-server `c2fa1e4`) was then run in Node against it, with a stand-in for the engine that does real HTTP and timers: an event between turns was submitted as a prompt once, and three events during a turn were held and the newest of each name submitted when the turn ended. Not run: the mod in a Claude Code session.
-- After the Worker was deployed with `hook` on `/deliveries` and `/ack` (version `ba05efcf`), every test that applies passes against it, including two readers on one mailbox.
-
-Game, 2026-11-22, forge-mcp-server `main` with the `mcp-events` mod polling the reader's endpoint, through the deployed mailbox. Counts are from the server's activity log as read by the session that ran the game, not counted line by line:
-
-- A Claude Code seat played 23 game turns between 18:18Z and 18:58Z. The server emitted 153 `forge.your_move` and 3 `forge.chat`. Every delivery line read was 200 on the first attempt, in 50 to 170 ms. The mod started about 45 turns and reported no missed events.
-- Before the game the server restarted at about 17:25Z. The reader, then refreshing every 5 minutes, subscribed again at 17:29:35Z. The four events emitted in between (`3c794fbd-1` to `-4`, the last one the coin-toss ask) were never delivered, and the seat waited on the coin toss until a person asked. The refresh is now every minute, and the server now sends a new subscription the pending ask. Neither has been run through a restart.
-- The reader ran for 17 hours before the game. It logged three failed mailbox fetches, one of them a 500 from the mailbox, and went on after each.
-
-Several servers, 2026-11-22, with forge-mcp-server branch `session-ports` at `bcd8437`: two server processes started 4 seconds apart, the second on a free port, each wrote its file, and one reader with a 1 second directory read subscribed to each about a second after it started. No event was sent through them.
-
-Two more games the same day, on LEGION7 through the deployed mailbox, with counts from the server's activity log as reported by the session that ran them:
-
-- After a restart of the server on port 3080 (reader at `f4d9ad1`, refresh every minute): the reader subscribed to the new process 7 seconds after it started, having been retrying every 15 seconds while the port was down. The server then emitted 163 events and logged 163 deliveries, all 200 on the first attempt. The reader logged no skip. No ask was pending at the restart, so the server's replay of one was not exercised.
-- With two servers (reader at `8a46e9e`, forge-mcp-server `bcd8437`): a stand-in held port 3080 and the playing session's server took a free port. The reader found it in the registry and subscribed 4 seconds after it started. That server emitted 118 events and logged 118 deliveries, all 200 on the first attempt. The reader's state holds 118 handled deliveries from it and its cursor reads 118. The mod, with `relay` on, started turns in that session from the reader's endpoint. The stand-in emitted nothing, so two servers did not send events at the same time.
-
-The first-poll request, 2026-11-22: accepted by forge-mcp-server's HTTP endpoint at `59864fd`, which answered with no events. Not run against `5933c34`, the build that answers with the waiting ask.
-
-Per-path limits, 2026-11-23: the mailbox tests pass in memory, and those that do not need a small limit or a movable clock pass under `wrangler dev`. Under `wrangler dev`, a hook and delivery written by the `main` Worker were read by this one with `lastReadAt` set and no `idleSeconds`, and the hook still accepted a POST. A hook with `idleSeconds: 60` and not fetched for 62 seconds was removed with its delivery at the next request, and a hook without it was kept. Deployed as version `2a248489` on 2026-11-24 at 01:32Z. The Durable Object went on running the previous code until 01:37Z, because an active object adopts new code up to 300 seconds after a deploy. After that, a hook created with `idleSeconds` listed it, deleting the hook removed its delivery, and the reader's hook listed no `idleSeconds` and a `lastReadAt` from its last fetch.
-
-Not tested: two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
-
-`spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written. It also shows the cases a reader has to handle: a mailbox that alters, invents or repeats a delivery, and a mailbox that is down.
+`spike/mailbox-spike.mjs` is the first check of the idea, run before the mailbox was written.

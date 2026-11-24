@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -391,19 +391,4 @@ test("run subscribes to a server that appears in the directory, and goes on when
     await running;
     await other.close();
   }
-});
-
-test("a state file from before several servers keeps its subscriptions and cursors", async () => {
-  const first = setUp(["a.moved"]);
-  await first.reader.subscribe();
-  const made = first.sub("a.moved");
-  const state = JSON.parse(readFileSync(first.options.stateFile, "utf8"));
-  const { servers, ...rest } = state;
-  writeFileSync(first.options.stateFile, JSON.stringify({ ...rest, ...servers[server.url] }));
-
-  const second = setUp(["a.moved"], { stateFile: first.options.stateFile });
-  await send(made, "ep-1", {});
-  assert.equal(await second.reader.poll(), 1, "the subscription id is still known");
-  await second.reader.subscribe();
-  assert.equal(second.sub("a.moved").cursor, servers[server.url].cursors["a.moved"]);
 });

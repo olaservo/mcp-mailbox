@@ -56,14 +56,14 @@ export class PollEndpoint {
     const { name, cursor } = params;
     if (typeof name !== "string" || !this.names.includes(name)) throw new RpcError(INVALID_PARAMS, `unknown event ${String(name)}`);
     const head = `${this.epoch}:${this.seq}`;
-    const starting = () => ({ events: [] as EventBody[], cursor: head, hasMore: false, nextPollMs: POLL_MS });
-    // No cursor: the client starts from now.
-    if (cursor == null) return { ...starting(), events: await this.pending(name), truncated: false };
+    // A client starting out is given what the servers say is waiting, then follows from now.
+    const start = async (truncated: boolean) => ({ events: await this.pending(name), cursor: head, truncated, hasMore: false, nextPollMs: POLL_MS });
+    if (cursor == null) return start(false);
 
     const [epoch, raw] = String(cursor).split(":");
     const from = Number(raw);
     const oldest = this.entries[0]?.seq ?? this.seq + 1;
-    if (epoch !== this.epoch || !Number.isInteger(from) || from > this.seq || from < oldest - 1) return { ...starting(), events: await this.pending(name), truncated: true };
+    if (epoch !== this.epoch || !Number.isInteger(from) || from > this.seq || from < oldest - 1) return start(true);
 
     const floor = typeof params.maxAgeMs === "number" ? Date.now() - params.maxAgeMs : -Infinity;
     const since = this.entries.filter((e) => e.seq > from && e.event.name === name);
