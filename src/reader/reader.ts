@@ -1,6 +1,7 @@
-import { randomBytes } from "node:crypto";
+import { createPrivateKey, generateKeyPairSync, randomBytes, type JsonWebKey } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { openSeq, setupR } from "./hpke.ts";
 import { MAX_HELD_MS, refusal, type Fetched } from "./verify.ts";
 
 /** An event occurrence as SEP-3415 delivers it by webhook. */
@@ -37,7 +38,12 @@ export interface ReaderOptions {
   scanMs?: number;
   /** Event names to subscribe to. */
   events: string[];
-  /** JSON file with the signing secret, the hook and the position in the mailbox. */
+  /**
+   * Asks each server to encrypt event data to the reader's key, so the mailbox cannot read it. A server that
+   * does not list the scheme is not subscribed, and a delivery that is not encrypted is skipped.
+   */
+  encrypt?: boolean;
+  /** JSON file with the signing secret, the key pair, the hook and the position in the mailbox. */
   stateFile: string;
   /** Called with each event, one at a time, in order. */
   handle: (received: Received) => Promise<void> | void;
@@ -54,6 +60,8 @@ export interface ReaderOptions {
 
 interface State {
   secret: string;
+  /** The X25519 key pair event data is encrypted to, as a JWK: `x` is the public key and `d` the private key. */
+  key?: JsonWebKey;
   hook?: { token: string; url: string };
   /** The highest mailbox sequence number handled. */
   after: number;
@@ -64,6 +72,9 @@ interface State {
 }
 
 const PROTOCOL_VERSION = "2026-07-28";
+/** DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, for the experiment in forge-mcp-server issue 9. SEP-3415 does not define it. */
+const SCHEME = "hpke-x25519-sha256-aes128gcm";
+const AES_128_GCM = 1;
 /** Subscription lifetime asked for. */
 const TTL_MS = 60 * 60 * 1000;
 /** Longest time between refreshes. A refresh also restores a subscription the server lost in a restart. */
@@ -109,6 +120,11 @@ export class Reader {
     this.log = opts.log ?? (() => {});
     if (!opts.server && !opts.servers) throw new Error("no server to subscribe to");
     this.state = this.load();
+    if (opts.encrypt && !this.state.key) {
+      this.state.key = generateKeyPairSync("x25519").privateKey.export({ format: "jwk" });
+      // Saved before a server is sent the public key.
+      this.save();
+    }
   }
 
   /** The callback URL, once `subscribe` has run. */
@@ -282,7 +298,7 @@ export class Reader {
     const subscriptionId = delivery.headers["x-mcp-subscription-id"]!;
     const name = Object.values(this.state.servers).flatMap((server) => Object.entries(server.subscriptions)).find(([, id]) => id === subscriptionId)?.[0];
     if (name === undefined) return "unknown subscription";
-    let body: (Partial<EventBody> & { type?: unknown }) | null;
+    let body: (Partial<EventBody> & { type?: unknown; encrypted?: { enc: string; ct: string } }) | null;
     try {
       body = JSON.parse(Buffer.from(delivery.body, "base64").toString("utf8")) as typeof body;
     } catch {
@@ -291,9 +307,28 @@ export class Reader {
     if (body === null || typeof body !== "object") return "body is not a JSON object";
     // `gap` and `terminated`. The next refresh subscribes again after a `terminated`.
     if (typeof body.type === "string") return `control envelope ${body.type}`;
+    const { encrypted, ...clear } = body;
+    if (!this.opts.encrypt && encrypted !== undefined) return "encrypted, and encryption is off";
+    if (this.opts.encrypt) {
+      if (encrypted === undefined) return "not encrypted";
+      try {
+        body = { ...clear, data: this.open(subscriptionId, clear, encrypted) };
+      } catch {
+        return "does not decrypt";
+      }
+    }
     // The subscription id header is not signed and the event name is.
     if (body.name !== name) return `event ${body.name} on a subscription for ${name}`;
     return { subscriptionId, webhookId: delivery.headers["webhook-id"]!, receivedAt: delivery.receivedAt, event: body as EventBody };
+  }
+
+  /** The `data` of an encrypted event. Throws unless it was sealed to this reader's key, for this subscription and these clear fields. */
+  private open(subscriptionId: string, event: Partial<EventBody>, sealed: { enc: string; ct: string }): unknown {
+    const key = createPrivateKey({ key: this.state.key!, format: "jwk" });
+    // The subscription id is in `info`, so a delivery moved to another subscription does not open.
+    const context = setupR(AES_128_GCM, Buffer.from(sealed.enc, "base64url"), key, Buffer.from(`mcp-events v1 ${subscriptionId}`));
+    const aad = Buffer.from(`${event.eventId}\n${event.name}\n${event.timestamp}`);
+    return JSON.parse(openSeq(AES_128_GCM, context, 0, aad, Buffer.from(sealed.ct, "base64url")).toString("utf8"));
   }
 
   /** The servers to subscribe to now. One whose file is gone is forgotten. */
@@ -324,15 +359,37 @@ export class Reader {
   /** Subscribes or refreshes every event on one server. Returns when its first subscription lapses. */
   private async subscribeTo(server: Server, hookUrl: string): Promise<number> {
     const held = (this.state.servers[server.url] ??= { subscriptions: {}, cursors: {} });
+    const encryption = this.opts.encrypt ? { scheme: SCHEME, publicKey: this.state.key!.x } : undefined;
+    if (encryption) {
+      // Asked before every subscribe. A server without the field would take the subscription and deliver in the clear.
+      const { events = [] } = (await this.rpc(server, "events/list", {})) as { events?: { name: string; encryption?: unknown }[] };
+      const lists = (name: string) => {
+        const schemes = events.find((event) => event.name === name)?.encryption;
+        return Array.isArray(schemes) && schemes.includes(SCHEME);
+      };
+      const without = this.opts.events.filter((name) => !lists(name));
+      if (without.length > 0) {
+        // Subscriptions from a run without encryption, or from before the server lost it.
+        for (const name of Object.keys(held.subscriptions)) await this.drop(server, hookUrl, name);
+        this.save();
+        throw new Error(`events/list does not list ${SCHEME} for ${without.join(", ")}`);
+      }
+    }
     let lapses = Infinity;
+    const refused: string[] = [];
     for (const name of this.opts.events) {
       const result = (await this.rpc(server, "events/subscribe", {
         name,
         arguments: {},
-        delivery: { mode: "webhook", url: hookUrl, secret: this.state.secret },
+        delivery: { mode: "webhook", url: hookUrl, secret: this.state.secret, encryption },
         ttlMs: TTL_MS,
         cursor: held.cursors[name] ?? null,
-      })) as { id: string; cursor?: string | null; refreshBefore?: string | null; truncated?: boolean; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
+      })) as { id: string; cursor?: string | null; refreshBefore?: string | null; truncated?: boolean; delivery?: { encryption?: { scheme?: string } }; deliveryStatus?: { lastError?: string | null; failedSince?: string } };
+      if (encryption && result.delivery?.encryption?.scheme !== SCHEME) {
+        await this.drop(server, hookUrl, name);
+        refused.push(name);
+        continue;
+      }
       if (held.subscriptions[name] !== result.id) this.log(`subscribed ${name} as ${result.id} at ${server.url}`);
       held.subscriptions[name] = result.id;
       if (typeof result.cursor === "string") held.cursors[name] = result.cursor;
@@ -341,7 +398,14 @@ export class Reader {
       if (result.deliveryStatus?.lastError) this.log(`${name} at ${server.url}: the server's last delivery failed: ${result.deliveryStatus.lastError}, failing since ${result.deliveryStatus.failedSince ?? "unknown"}`);
     }
     this.save();
+    if (refused.length > 0) throw new Error(`the result for ${refused.join(", ")} does not say ${SCHEME} is in effect; unsubscribed`);
     return lapses;
+  }
+
+  /** Gives up a subscription the server would deliver in the clear. */
+  private async drop(server: Server, hookUrl: string, name: string): Promise<void> {
+    delete this.state.servers[server.url]?.subscriptions[name];
+    await this.rpc(server, "events/unsubscribe", { name, arguments: {}, delivery: { mode: "webhook", url: hookUrl } }).catch(() => {});
   }
 
   private async ensureHook(): Promise<{ token: string; url: string }> {
@@ -370,9 +434,9 @@ export class Reader {
   }
 
   /** One JSON-RPC request over Streamable HTTP, in the 2026-07-28 form: no session, the envelope in `_meta`. */
-  private async rpc(server: Server, method: string, params: { name: string } & Record<string, unknown>, signal = this.stopping): Promise<unknown> {
+  private async rpc(server: Server, method: string, params: { name?: string } & Record<string, unknown>, signal = this.stopping): Promise<unknown> {
     const { url, token } = server;
-    const name = /^[\x20-\x7e]*$/.test(params.name) ? params.name : `=?base64?${Buffer.from(params.name).toString("base64")}?=`;
+    const name = params.name === undefined || /^[\x20-\x7e]*$/.test(params.name) ? params.name : `=?base64?${Buffer.from(params.name).toString("base64")}?=`;
     const meta = {
       "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
       "io.modelcontextprotocol/clientInfo": { name: "mcp-mailbox-reader", version: "0.0.0" },
@@ -385,7 +449,7 @@ export class Reader {
         accept: "application/json, text/event-stream",
         "mcp-protocol-version": PROTOCOL_VERSION,
         "mcp-method": method,
-        "mcp-name": name,
+        ...(name === undefined ? {} : { "mcp-name": name }),
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: ++this.rpcId, method, params: { ...params, _meta: meta } }),
