@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "A mailbox for MCP Events webhook delivery (SEP-3415)",
+  "license": "MIT",
   "engines": {
     "node": ">=24"
   },

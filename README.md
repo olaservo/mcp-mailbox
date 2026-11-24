@@ -13,22 +13,31 @@ Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server
   mailbox (Worker, holds no secret)  ──────────────────────────┘  mcp-events mod
 ```
 
+## For implementers
+
+SEP-3415 allows a webhook callback that is not the client: "A common deployment is a forward proxy that receives webhooks and serves events to clients by poll or push." This is one such relay, and it needs no spec change. The client generates `delivery.secret` and keeps it. The relay stores and hands out deliveries, and cannot forge or alter one without the client's check failing.
+
+The relay can still read events, drop them, and hand an old one out again. A client reading through it has to:
+
+- verify `webhook-signature` over the stored bytes with its own secret;
+- check `webhook-timestamp` against the time the relay received the delivery (`receivedAt`), since a held delivery is older than 5 minutes by the client's clock;
+- deduplicate on `x-mcp-subscription-id` plus `webhook-id`;
+- check that the event name in the signed body matches the subscription, since the subscription id header is not signed;
+- order events by their content. Observed with forge-mcp-server: it POSTs events concurrently, and four events emitted in order arrived in another order.
+
+Where the mailbox departs from the SEP: it echoes the verification challenge for any registered path without checking a signature. The SEP says the receiver verifies before echoing. The mailbox has no secret to verify with, and registering the path is the consent.
+
+Where the SEP leaves a gap:
+
+- A server that gives up retrying loses that event, and the client is not told while its subscription stays live. The SEP says such an event can be recovered by cursor replay, and also that a cursor on the refresh of a live subscription is a no-op. The workaround is to unsubscribe and subscribe again with the saved cursor. The reader does not do this. See [ext-events#9](https://github.com/modelcontextprotocol/ext-events/issues/9).
+- The relay is the only durability between server and client. An event the server emits while the relay is down past the server's retries is lost.
+- The relay can read every event. Hiding them from it needs the server to encrypt `data` to a key the client supplies, which the SEP does not define. That part is not built here.
+
 ## Parts
 
 - Mailbox (built): a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. It runs as a Cloudflare Worker with one SQLite Durable Object. `src/core.ts` holds the HTTP surface and does not depend on Workers.
 - Reader (built): a Node process that subscribes with a mailbox hook as the callback, fetches, verifies, deduplicates, orders and hands each event on: to stdout, a command, or a local poll endpoint. `src/reader/`. It has no dependencies.
 - Encryption (not started): the server encrypts the payload to a key the client supplies, so the mailbox cannot read events.
-
-## What the mailbox can and cannot do
-
-It has no signing secret, so it cannot forge or alter a delivery without the reader's verification failing. It can read events, drop them, and hand an old one out again. The reader therefore has to:
-
-- verify `webhook-signature` over the stored bytes with its own secret;
-- check `webhook-timestamp` against the delivery's `receivedAt`, since a held delivery is older than 5 minutes by the reader's clock;
-- deduplicate on `x-mcp-subscription-id` plus `webhook-id`;
-- order events by their own content. `seq` is arrival order. Observed against the deployed mailbox: forge-mcp-server POSTs events concurrently, and four events emitted in order arrived in another order.
-
-A server that does not replay over webhook loses any event it emits while the mailbox is down past its retries.
 
 ## API
 
