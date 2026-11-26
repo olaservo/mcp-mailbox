@@ -171,6 +171,7 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 - The tests pass in memory, under `wrangler dev` and against the deployed Worker.
 - Endpoint verification: forge-mcp-server's handshake passes against the mailbox with its `https` and public-address checks on. From 0.3.0 it reads the well-known document and sends no challenge, and the games on 2026-11-24 ran 0.3.1.
 - Games, 2026-11-22 to 24, through the deployed mailbox: seven games with every event the server emitted delivered (156, 163, 118, 108, 96, 136 and 102). In the last three the reader handed on every event once, with no gaps in the event ids. A poll with no cursor returned each pending ask once (23 asks). After a server restart the reader subscribed to the new process 7 seconds later.
+- Encryption, 2026-11-25 and 26, through the deployed mailbox with `READER_ENCRYPT=1` and forge-mcp-server 0.4.0 and 0.5.0: four games with 70, 74, 111 and 66 events, each decrypted and handed on once with no gaps in the event ids. In the third the session held no subscription of its own and was woken only by the reader's decrypted events. The bodies the mailbox held were not read back.
 - A Worker deploy reaches an active Durable Object up to 5 minutes late. Observed on 2026-11-23.
 
-Not tested: encryption in a game or through the deployed mailbox, two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
+Not tested: the 503 answer on the deployed Worker, two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
