@@ -287,6 +287,17 @@ test("a hook the mailbox no longer has is replaced at the next refresh", async (
   assert.deepEqual(ids(), ["ep-1"]);
 });
 
+test("a mailbox request that fails is reported with the status and what the mailbox said", async () => {
+  const down = createServer((_req, res) => res.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({ error: "mailbox unavailable: storage is down" })));
+  await new Promise<void>((resolve) => down.listen(0, "127.0.0.1", resolve));
+  try {
+    const { reader } = setUp(["a.moved"], { mailbox: { url: `http://127.0.0.1:${(down.address() as AddressInfo).port}`, key: target.key } });
+    await assert.rejects(reader.subscribe(), { message: 'mailbox POST /hooks: 503 {"error":"mailbox unavailable: storage is down"}' });
+  } finally {
+    down.close();
+  }
+});
+
 test("unsubscribe tells the server and removes the hook", async () => {
   const { reader, sub } = setUp(["a.gone"]);
   await reader.subscribe();

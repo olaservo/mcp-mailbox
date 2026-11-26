@@ -85,8 +85,41 @@ export class Waiters {
   }
 }
 
+/**
+ * A store that makes a read or an ack once more, on a new store from `open`, when it fails with an error marked
+ * `retryable` and not `overloaded`. `createHook`, `deleteHook` and `insert` are made once: the first call may have taken effect.
+ */
+export function retrying(open: () => Store, waitMs = 100): Store {
+  const twice = async <T>(call: (store: Store) => Promise<T>): Promise<T> => {
+    try {
+      return await call(open());
+    } catch (err) {
+      const { retryable, overloaded } = err as { retryable?: unknown; overloaded?: unknown };
+      if (retryable !== true || overloaded === true) throw err;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      return call(open());
+    }
+  };
+  return {
+    createHook: (...args) => open().createHook(...args),
+    deleteHook: (...args) => open().deleteHook(...args),
+    insert: (...args) => open().insert(...args),
+    hasHook: (...args) => twice((store) => store.hasHook(...args)),
+    listHooks: () => twice((store) => store.listHooks()),
+    list: (...args) => twice((store) => store.list(...args)),
+    ack: (...args) => twice((store) => store.ack(...args)),
+  };
+}
+
 const json = (status: number, value: unknown) => Response.json(value, { status });
 const error = (status: number, message: string) => json(status, { error: message });
+
+/** The answer when the store throws. The reason is logged, and sent only to a caller that gave the key. */
+function unavailable(route: string, err: unknown, withReason: boolean): Response {
+  const reason = err instanceof Error ? err.message : String(err);
+  console.error(`${route}: ${reason}`);
+  return Response.json({ error: withReason ? `mailbox unavailable: ${reason}` : "mailbox unavailable" }, { status: 503, headers: { "retry-after": "1" } });
+}
 
 function base64(bytes: Uint8Array): string {
   let binary = "";
@@ -164,7 +197,7 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
   const token = parts[1];
   if (token !== undefined && !TOKEN.test(token)) return error(404, "not found");
 
-  if (route === "POST /hooks/:token") return receive(request, store, token!, now);
+  if (route === "POST /hooks/:token") return receive(request, store, token!, now).catch((err: unknown) => unavailable(route, err, false));
 
   if (!["POST /hooks", "GET /hooks", "DELETE /hooks/:token", "GET /deliveries", "POST /ack"].includes(route)) {
     return error(404, "not found");
@@ -173,37 +206,41 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
   const given = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "")?.[1];
   if (given === undefined || !(await sameString(given, opts.key))) return error(401, "unauthorized");
 
-  switch (route) {
-    case "POST /hooks": {
-      const input = (await request.json().catch(() => ({}))) as { label?: unknown; idleSeconds?: unknown } | null;
-      const label = typeof input?.label === "string" ? input.label.slice(0, 200) : "";
-      const idleSeconds = input?.idleSeconds;
-      if (idleSeconds !== undefined && (!Number.isSafeInteger(idleSeconds) || (idleSeconds as number) < MIN_IDLE_SECONDS || (idleSeconds as number) > MAX_IDLE_SECONDS)) {
-        return error(400, `idleSeconds is a whole number from ${MIN_IDLE_SECONDS} to ${MAX_IDLE_SECONDS}`);
+  try {
+    switch (route) {
+      case "POST /hooks": {
+        const input = (await request.json().catch(() => ({}))) as { label?: unknown; idleSeconds?: unknown } | null;
+        const label = typeof input?.label === "string" ? input.label.slice(0, 200) : "";
+        const idleSeconds = input?.idleSeconds;
+        if (idleSeconds !== undefined && (!Number.isSafeInteger(idleSeconds) || (idleSeconds as number) < MIN_IDLE_SECONDS || (idleSeconds as number) > MAX_IDLE_SECONDS)) {
+          return error(400, `idleSeconds is a whole number from ${MIN_IDLE_SECONDS} to ${MAX_IDLE_SECONDS}`);
+        }
+        const created = newToken();
+        await store.createHook(created, label, now, idleSeconds as number | undefined);
+        return json(201, { token: created, url: `${url.origin}/hooks/${created}`, label, ...(idleSeconds !== undefined ? { idleSeconds } : {}) });
       }
-      const created = newToken();
-      await store.createHook(created, label, now, idleSeconds as number | undefined);
-      return json(201, { token: created, url: `${url.origin}/hooks/${created}`, label, ...(idleSeconds !== undefined ? { idleSeconds } : {}) });
+      case "GET /hooks":
+        return json(200, { hooks: await store.listHooks() });
+      case "DELETE /hooks/:token":
+        return (await store.deleteHook(token!)) ? json(200, {}) : error(404, "not found");
+      case "GET /deliveries": {
+        const after = wholeNumber(url.searchParams.get("after"), 0, Number.MAX_SAFE_INTEGER);
+        const limit = wholeNumber(url.searchParams.get("limit"), 100, MAX_FETCH);
+        const wait = wholeNumber(url.searchParams.get("wait"), 0, MAX_WAIT_MS / 1000);
+        if (after === undefined || limit === undefined || wait === undefined) return error(400, "after, limit and wait are whole numbers");
+        const hook = url.searchParams.get("hook") ?? undefined;
+        if (hook !== undefined && !TOKEN.test(hook)) return error(400, "hook is a hook token");
+        const deliveries = await store.list(after, Math.max(1, limit), wait * 1000, hook, now);
+        return json(200, { deliveries: deliveries.map((d) => ({ ...d, body: base64(d.body) })) });
+      }
+      default: {
+        const input = (await request.json().catch(() => null)) as { upTo?: unknown; hook?: unknown } | null;
+        if (typeof input?.upTo !== "number" || !Number.isSafeInteger(input.upTo) || input.upTo < 0) return error(400, "upTo is a whole number");
+        if (input.hook !== undefined && (typeof input.hook !== "string" || !TOKEN.test(input.hook))) return error(400, "hook is a hook token");
+        return json(200, { deleted: await store.ack(input.upTo, input.hook) });
+      }
     }
-    case "GET /hooks":
-      return json(200, { hooks: await store.listHooks() });
-    case "DELETE /hooks/:token":
-      return (await store.deleteHook(token!)) ? json(200, {}) : error(404, "not found");
-    case "GET /deliveries": {
-      const after = wholeNumber(url.searchParams.get("after"), 0, Number.MAX_SAFE_INTEGER);
-      const limit = wholeNumber(url.searchParams.get("limit"), 100, MAX_FETCH);
-      const wait = wholeNumber(url.searchParams.get("wait"), 0, MAX_WAIT_MS / 1000);
-      if (after === undefined || limit === undefined || wait === undefined) return error(400, "after, limit and wait are whole numbers");
-      const hook = url.searchParams.get("hook") ?? undefined;
-      if (hook !== undefined && !TOKEN.test(hook)) return error(400, "hook is a hook token");
-      const deliveries = await store.list(after, Math.max(1, limit), wait * 1000, hook, now);
-      return json(200, { deliveries: deliveries.map((d) => ({ ...d, body: base64(d.body) })) });
-    }
-    default: {
-      const input = (await request.json().catch(() => null)) as { upTo?: unknown; hook?: unknown } | null;
-      if (typeof input?.upTo !== "number" || !Number.isSafeInteger(input.upTo) || input.upTo < 0) return error(400, "upTo is a whole number");
-      if (input.hook !== undefined && (typeof input.hook !== "string" || !TOKEN.test(input.hook))) return error(400, "hook is a hook token");
-      return json(200, { deleted: await store.ack(input.upTo, input.hook) });
-    }
+  } catch (err) {
+    return unavailable(route, err, true);
   }
 }
