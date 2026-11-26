@@ -55,6 +55,8 @@ Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
 
 Deliveries not acked are dropped after 7 days.
 
+When the store throws, the route answers 503 with `retry-after: 1` and the reason is logged. Reader routes also give the reason in `error`. The Worker first makes a read or an ack once more, on a new stub, when the Durable Object's error is marked `retryable` and not `overloaded`. A stored delivery and a hook change are made once.
+
 ## Reader
 
 ```bash

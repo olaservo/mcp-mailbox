@@ -429,7 +429,11 @@ export class Reader {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: this.stopping,
     });
-    if (!res.ok) throw new Error(`mailbox ${method} ${path.split("?")[0]}: ${res.status}`);
+    if (!res.ok) {
+      // The body names the reason: the mailbox's own `error`, or the platform's error page.
+      const said = (await res.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 200);
+      throw new Error(`mailbox ${method} ${path.split("?")[0]}: ${res.status}${said ? ` ${said}` : ""}`);
+    }
     return res;
   }
 

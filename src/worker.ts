@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { handle, MAX_PER_HOOK, MAX_STORED, RETENTION_MS, Waiters, type Delivery, type Hook, type Store } from "./core.ts";
+import { handle, MAX_PER_HOOK, MAX_STORED, RETENTION_MS, retrying, Waiters, type Delivery, type Hook, type Store } from "./core.ts";
 
 type DeliveryRow = { seq: number; hook: string; received_at: number; headers: string; body: ArrayBuffer };
 type HookRow = { token: string; label: string; created_at: number; last_read_at: number | null; idle_seconds: number | null };
@@ -121,7 +121,8 @@ export class Mailbox extends DurableObject<Env> implements Store {
 
 export default {
   async fetch(request, env): Promise<Response> {
-    const store = env.MAILBOX.getByName("default") as unknown as Store;
+    // A stub that has thrown can be broken, so each call gets a new one.
+    const store = retrying(() => env.MAILBOX.getByName("default") as unknown as Store);
     return handle(request, store, { key: env.MAILBOX_KEY });
   },
 } satisfies ExportedHandler<Env>;

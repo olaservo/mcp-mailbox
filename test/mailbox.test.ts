@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { handle, retrying } from "../src/core.ts";
+import { MemoryStore } from "../src/memory.ts";
 import { reader, startMailbox, type Target } from "./harness.ts";
 
 let target: Target;
@@ -207,4 +209,55 @@ test("fetch and ack can be limited to one hook", async () => {
   assert.deepEqual(left.map((d) => d.hook), [two.token]);
   assert.equal((await fetch(`${target.base}/deliveries?hook=short`, { headers: { authorization: `Bearer ${target.key}` } })).status, 400);
   await mailbox.ack(left[0]!.seq);
+});
+
+const failing = (err: Error) => {
+  const opened = { count: 0 };
+  const fail = async (): Promise<never> => {
+    throw err;
+  };
+  return { opened, open: () => (opened.count++, { createHook: fail, deleteHook: fail, hasHook: fail, listHooks: fail, insert: fail, list: fail, ack: fail }) };
+};
+
+test("a store that throws answers 503, and names the reason only to a caller with the key", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  const key = "k".repeat(43);
+  const store = failing(new Error("storage is down")).open();
+  const fetched = await handle(new Request("http://mailbox.test/deliveries", { headers: { authorization: `Bearer ${key}` } }), store, { key });
+  assert.equal(fetched.status, 503);
+  assert.equal(fetched.headers.get("retry-after"), "1");
+  assert.deepEqual(await fetched.json(), { error: "mailbox unavailable: storage is down" });
+  const posted = await handle(new Request(`http://mailbox.test/hooks/${unknownToken}`, { method: "POST", body: JSON.stringify({ eventId: "1" }) }), store, { key });
+  assert.equal(posted.status, 503);
+  assert.deepEqual(await posted.json(), { error: "mailbox unavailable" });
+  assert.deepEqual(logged.mock.calls.map((call) => call.arguments[0]), ["GET /deliveries: storage is down", "POST /hooks/:token: storage is down"]);
+});
+
+test("a read that fails with a retryable error is made once more on a new store", async () => {
+  const retryable = Object.assign(new Error("reset"), { retryable: true });
+  const once = failing(retryable);
+  const good = new MemoryStore();
+  const store = retrying(() => (once.opened.count === 0 ? once.open() : (once.opened.count++, good)), 0);
+  assert.deepEqual(await store.listHooks(), []);
+  assert.equal(once.opened.count, 2);
+
+  const always = failing(retryable);
+  await assert.rejects(retrying(always.open, 0).listHooks(), /reset/);
+  assert.equal(always.opened.count, 2);
+});
+
+test("a write, an overloaded store and an error not marked retryable are not tried again", async () => {
+  const write = failing(Object.assign(new Error("reset"), { retryable: true }));
+  await assert.rejects(retrying(write.open, 0).insert(unknownToken, 0, {}, new Uint8Array()), /reset/);
+  await assert.rejects(retrying(write.open, 0).createHook(unknownToken, "", 0), /reset/);
+  await assert.rejects(retrying(write.open, 0).deleteHook(unknownToken), /reset/);
+  assert.equal(write.opened.count, 3);
+
+  const overloaded = failing(Object.assign(new Error("overloaded"), { retryable: true, overloaded: true }));
+  await assert.rejects(retrying(overloaded.open, 0).listHooks(), /overloaded/);
+  assert.equal(overloaded.opened.count, 1);
+
+  const plain = failing(new Error("broken"));
+  await assert.rejects(retrying(plain.open, 0).ack(1), /broken/);
+  assert.equal(plain.opened.count, 1);
 });
