@@ -2,7 +2,7 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. The reader's half of encryption is built. It has run against forge-mcp-server in tests, and not in a game.
+Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. The reader's half of encryption is built, and has run in four games against forge-mcp-server 0.4.0 and 0.5.0.
 
 ```
                events/subscribe (callback: hook URL, secret)
@@ -37,7 +37,7 @@ Where the SEP leaves a gap:
 
 - Mailbox (built): a public `https` endpoint that answers the verification challenge for registered paths and stores each delivery as raw bytes and headers. It runs as a Cloudflare Worker with one SQLite Durable Object. `src/core.ts` holds the HTTP surface and does not depend on Workers.
 - Reader (built): a Node process that subscribes with a mailbox hook as the callback, fetches, verifies, deduplicates, orders and hands each event on: to stdout, a command, or a local poll endpoint. `src/reader/`. It has no dependencies.
-- Encryption (reader's half built, off by default): the server encrypts the payload to a key the reader supplies, so the mailbox cannot read events. forge-mcp-server has the server's half after 0.3.1, not yet in a release.
+- Encryption (reader's half built, off by default): the server encrypts the payload to a key the reader supplies, so the mailbox cannot read events. forge-mcp-server has the server's half from 0.4.0.
 
 ## API
 
@@ -58,6 +58,8 @@ Deliveries not acked are dropped after 7 days.
 When the store throws, the route answers 503 with `retry-after: 1` and the reason is logged. Reader routes also give the reason in `error`. The Worker first makes a read or an ack once more, on a new stub, when the Durable Object's error is marked `retryable` and not `overloaded`. A stored delivery and a hook change are made once.
 
 ## Reader
+
+The reader is not published to npm. Run it from a clone.
 
 ```bash
 node --env-file=<file> src/reader/cli.ts            # run until stopped
@@ -109,14 +111,23 @@ With `READER_SERVERS_DIR` set, the reader subscribes to every server that has a 
 With `READER_POLL_PORT` set, the reader answers `events/list` and `events/poll` as JSON-RPC POSTs on that port, on any path. A client that polls and has no webhook support can then follow a server through the mailbox. For the `mcp-events` Claude Code mod in forge-mcp-server, set its `url` option to `http://127.0.0.1:<port>/mcp`.
 
 - Events are kept in memory, the newest 1000. A poll with no cursor starts from now. A cursor from before a restart of the reader polls as `truncated`.
-- On either of those polls the reader also sends each server a poll with no cursor for that event, and returns what they answer. A server that keeps an ask waiting can give it to a client that starts late this way, as forge-mcp-server does from `5933c34`. The answers are not verified by signature, since they come from the server itself and not through the mailbox.
+- On either of those polls the reader also sends each server a poll with no cursor for that event, and returns what they answer. A server that keeps an ask waiting can give it to a client that starts late this way, as forge-mcp-server does from 0.1.0. The answers are not verified by signature, since they come from the server itself and not through the mailbox.
 - `maxAgeMs` and `maxEvents` are honoured. `nextPollMs` is 1000.
 - There is no authentication. It listens on loopback and refuses a request with an `Origin` header.
 - The client's tool calls still go to the MCP server itself. Only events take this path.
 
+### Limits
+
+- A handler that fails is logged and the event is not tried again.
+- Ordering holds within a batch. An event that arrives after its batch was handed on is handed on late.
+- Events a server emits after a restart and before the next refresh, up to a minute, are not delivered. forge-mcp-server's cursors are per process, so a cursor does not bring them back. It does send a new subscription the ask that is still pending.
+- A gap the server reports (`truncated`) is logged and not passed on to the handler or the poll endpoint.
+- The secret is not rotated.
+- `gap` and `terminated` envelopes are logged and nothing else is done.
+
 ### Encryption
 
-With `READER_ENCRYPT=1` the reader asks each server to encrypt event `data` to its key, so the mailbox holds ciphertext. SEP-3415 does not define this. It is the client half of the experiment in [forge-mcp-server#9](https://github.com/olaservo/forge-mcp-server/issues/9). forge-mcp-server has the server half on `main`, after 0.3.1 ([forge-mcp-server#24](https://github.com/olaservo/forge-mcp-server/pull/24)). 0.3.1 does not have it, so the reader does not subscribe to 0.3.1 with this set.
+With `READER_ENCRYPT=1` the reader asks each server to encrypt event `data` to its key, so the mailbox holds ciphertext. SEP-3415 does not define this. It is the client half of the experiment in [forge-mcp-server#9](https://github.com/olaservo/forge-mcp-server/issues/9). forge-mcp-server has the server half from 0.4.0 ([forge-mcp-server#24](https://github.com/olaservo/forge-mcp-server/pull/24)). The reader does not subscribe to an earlier release with this set.
 
 - The scheme is `hpke-x25519-sha256-aes128gcm`: RFC 9180 base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM. `src/reader/hpke.ts` does it with Node's `crypto`, and `test/hpke-vectors.json` holds the CFRG test vectors it is checked against.
 - The reader makes one X25519 key pair on first run and keeps it in the state file as a JWK.
@@ -127,15 +138,6 @@ With `READER_ENCRYPT=1` the reader asks each server to encrypt event `data` to i
 - The reader decrypts after the signature check. It skips a delivery that has no `encrypted` or does not decrypt. The subscription id is in `info`, so a delivery moved to another subscription does not decrypt.
 - Encryption covers the hop through the mailbox. The poll endpoint serves decrypted events, and what it asks a server directly does not pass through the mailbox.
 - Deliveries a server sent in the clear before the variable was set are skipped if the mailbox still holds them. To turn encryption off again, run `unsubscribe` first, then start without the variable. Without that the server refuses the refresh and goes on encrypting, and the reader skips those deliveries.
-
-Limits:
-
-- A handler that fails is logged and the event is not tried again.
-- Ordering holds within a batch. An event that arrives after its batch was handed on is handed on late.
-- Events a server emits after a restart and before the next refresh, up to a minute, are not delivered. forge-mcp-server's cursors are per process, so a cursor does not bring them back. It does send a new subscription the ask that is still pending.
-- A gap the server reports (`truncated`) is logged and not passed on to the handler or the poll endpoint.
-- The secret is not rotated.
-- `gap` and `terminated` envelopes are logged and nothing else is done.
 
 ## Develop
 
