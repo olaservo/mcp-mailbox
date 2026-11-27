@@ -2,7 +2,7 @@
 
 A mailbox for MCP Events webhook delivery (SEP-3415). An MCP server POSTs signed events to the mailbox. A client with no public address fetches them from the mailbox and verifies them with a secret the mailbox never holds.
 
-Status: the mailbox runs as a Cloudflare Worker, and games of a Forge MCP server have run through the reader since 2026-11-22. The reader's half of encryption is built, and has run in four games against forge-mcp-server 0.4.0 and 0.5.0.
+Status: the mailbox runs as a Cloudflare Worker. The reader has run against forge-mcp-server, in the clear and encrypted.
 
 ```
                events/subscribe (callback: hook URL, secret)
@@ -111,7 +111,7 @@ With `READER_SERVERS_DIR` set, the reader subscribes to every server that has a 
 With `READER_POLL_PORT` set, the reader answers `events/list` and `events/poll` as JSON-RPC POSTs on that port, on any path. A client that polls and has no webhook support can then follow a server through the mailbox. For the `mcp-events` Claude Code mod in forge-mcp-server, set its `url` option to `http://127.0.0.1:<port>/mcp`.
 
 - Events are kept in memory, the newest 1000. A poll with no cursor starts from now. A cursor from before a restart of the reader polls as `truncated`.
-- On either of those polls the reader also sends each server a poll with no cursor for that event, and returns what they answer. A server that keeps an ask waiting can give it to a client that starts late this way, as forge-mcp-server does from 0.1.0. The answers are not verified by signature, since they come from the server itself and not through the mailbox.
+- On either of those polls the reader also sends each server a poll with no cursor for that event, and returns what they answer. A server that holds an event for a client that starts late can give it this way. The answers are not verified by signature, since they come from the server itself and not through the mailbox.
 - `maxAgeMs` and `maxEvents` are honoured. `nextPollMs` is 1000.
 - There is no authentication. It listens on loopback and refuses a request with an `Origin` header.
 - The client's tool calls still go to the MCP server itself. Only events take this path.
@@ -120,7 +120,7 @@ With `READER_POLL_PORT` set, the reader answers `events/list` and `events/poll` 
 
 - A handler that fails is logged and the event is not tried again.
 - Ordering holds within a batch. An event that arrives after its batch was handed on is handed on late.
-- Events a server emits after a restart and before the next refresh, up to a minute, are not delivered. forge-mcp-server's cursors are per process, so a cursor does not bring them back. It does send a new subscription the ask that is still pending.
+- Events a server emits after a restart and before the next refresh, up to a minute, are not delivered. A cursor brings them back only from a server whose cursors survive its restart.
 - A gap the server reports (`truncated`) is logged and not passed on to the handler or the poll endpoint.
 - The secret is not rotated.
 - `gap` and `terminated` envelopes are logged and nothing else is done.
@@ -171,9 +171,7 @@ The key is at least 32 characters. Reader routes answer 503 without it.
 ## Tested
 
 - The tests pass in memory, under `wrangler dev` and against the deployed Worker.
-- Endpoint verification: forge-mcp-server's handshake passes against the mailbox with its `https` and public-address checks on. From 0.3.0 it reads the well-known document and sends no challenge, and the games on 2026-11-24 ran 0.3.1.
-- Games, 2026-11-22 to 24, through the deployed mailbox: seven games with every event the server emitted delivered (156, 163, 118, 108, 96, 136 and 102). In the last three the reader handed on every event once, with no gaps in the event ids. A poll with no cursor returned each pending ask once (23 asks). After a server restart the reader subscribed to the new process 7 seconds later.
-- Encryption, 2026-11-25 and 26, through the deployed mailbox with `READER_ENCRYPT=1` and forge-mcp-server 0.4.0 and 0.5.0: four games with 70, 74, 111 and 66 events, each decrypted and handed on once with no gaps in the event ids. In the third the session held no subscription of its own and was woken only by the reader's decrypted events. The bodies the mailbox held were not read back.
+- With forge-mcp-server through the deployed mailbox: endpoint verification by handshake and by the well-known document, and games from 2026-11-22, in the clear and encrypted. In the later games the reader handed on every event once, with no gaps in the event ids.
 - A Worker deploy reaches an active Durable Object up to 5 minutes late. Observed on 2026-11-23.
 
-Not tested: the 503 answer on the deployed Worker, two servers emitting during the same game, a server restart with an ask pending, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
+Not tested: the 503 answer on the deployed Worker, two servers emitting at the same time, a server restart while it holds an event for a late client, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.
