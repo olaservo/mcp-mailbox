@@ -48,11 +48,11 @@ Reader routes take `Authorization: Bearer <key>`, where the key is one of two ki
 
 The token in a hook's URL is not a key, because every server the reader subscribes to sees it. A route for a hook that is gone answers 404 to any key, so a reader can tell that from a wrong key.
 
-With `OPEN_HOOKS=1` anyone can create a hook without a key, up to 1,000 hooks. Such a hook always expires, after 7 days without a fetch unless it asks for less. The admin key passes the cap and can create a hook that is kept.
+With `OPEN_HOOKS=1` anyone can create a hook without a key, up to 1,000 hooks. Such a hook always expires, after 7 days without a fetch unless it asks for less. The admin key passes the cap and can create a hook that is kept. On the demo Worker, a Cloudflare rate limit also allows 10 hooks a minute from one address, counted per Cloudflare location, and answers 429 past that.
 
 | Route | Who | What |
 |---|---|---|
-| `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, readKey, label}`, and `idleSeconds` when set. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. Needs the admin key unless `OPEN_HOOKS` is on. 503 at the cap. |
+| `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, readKey, label}`, and `idleSeconds` when set. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. Needs the admin key unless `OPEN_HOOKS` is on. 503 at the cap, 429 past the rate limit. |
 | `GET /hooks` | reader | Lists callback paths with `createdAt`, `lastReadAt` and `idleSeconds`. Admin key only. |
 | `GET /hooks/<token>` | reader | One path, in the same form. |
 | `DELETE /hooks/<token>` | reader | Removes a path and its deliveries. Later POSTs to it get 404. |
@@ -178,7 +178,7 @@ npx wrangler secret put MAILBOX_KEY
 
 The key is at least 32 characters. Without it and without `OPEN_HOOKS`, `POST /hooks` answers 503. A deploy can reach a running Durable Object up to 5 minutes late.
 
-`npx wrangler deploy --env demo` deploys a second Worker, `mcp-mailbox-demo`, with `OPEN_HOOKS=1` and its own Durable Object. It needs no `MAILBOX_KEY`. One set with `npx wrangler secret put MAILBOX_KEY --env demo` lets you list its hooks.
+`npx wrangler deploy --env demo` deploys a second Worker, `mcp-mailbox-demo`, with `OPEN_HOOKS=1`, the rate limit and its own Durable Object. The rate limit's `namespace_id` in `wrangler.jsonc` has to be unique within the Cloudflare account. It needs no `MAILBOX_KEY`. One set with `npx wrangler secret put MAILBOX_KEY --env demo` lets you list its hooks.
 
 ## Tested
 

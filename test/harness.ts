@@ -14,7 +14,7 @@ export interface Target {
 }
 
 /** MAILBOX_URL and MAILBOX_KEY point the tests at a running mailbox. Without them, one starts here in memory. `key: null` starts it with no admin key. */
-export async function startMailbox(opts: { maxStored?: number; maxPerHook?: number; now?: () => number; openHooks?: boolean; maxHooks?: number; key?: null } = {}): Promise<Target> {
+export async function startMailbox(opts: { maxStored?: number; maxPerHook?: number; now?: () => number; openHooks?: boolean; maxHooks?: number; allowOpenHook?: (request: Request) => Promise<boolean>; key?: null } = {}): Promise<Target> {
   if (process.env.MAILBOX_URL) {
     return { base: process.env.MAILBOX_URL.replace(/\/$/, ""), key: process.env.MAILBOX_KEY ?? "", remote: true, close: async () => {} };
   }
@@ -31,7 +31,7 @@ export async function startMailbox(opts: { maxStored?: number; maxPerHook?: numb
       }
       const hasBody = req.method !== "GET" && req.method !== "HEAD";
       const request = new Request(`http://${req.headers.host}${req.url}`, { method: req.method, headers, body: hasBody ? Buffer.concat(chunks) : undefined });
-      const response = await handle(request, store, { key, now, openHooks: opts.openHooks, maxHooks: opts.maxHooks });
+      const response = await handle(request, store, { key, now, openHooks: opts.openHooks, maxHooks: opts.maxHooks, allowOpenHook: opts.allowOpenHook });
       res.writeHead(response.status, Object.fromEntries(response.headers));
       res.end(Buffer.from(await response.arrayBuffer()));
     });

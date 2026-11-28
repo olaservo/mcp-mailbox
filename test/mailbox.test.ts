@@ -274,6 +274,21 @@ test("with open hooks anyone can create a hook, which expires, up to the cap tha
   }
 });
 
+test("a hook created without the admin key waits when the rate limit says so, and one with it does not", async (t) => {
+  if (target.remote) return t.skip("needs open hooks, set only on the in-memory mailbox");
+  let allowed = 1;
+  const limited = await startMailbox({ openHooks: true, allowOpenHook: async () => allowed-- > 0 });
+  try {
+    await reader(limited, "").createHook("first");
+    const refused = await fetch(`${limited.base}/hooks`, { method: "POST", body: "{}" });
+    assert.equal(refused.status, 429);
+    assert.equal(refused.headers.get("retry-after"), "60");
+    await reader(limited).createHook("admin");
+  } finally {
+    await limited.close();
+  }
+});
+
 const failing = (err: Error) => {
   const opened = { count: 0 };
   const fail = async (): Promise<never> => {

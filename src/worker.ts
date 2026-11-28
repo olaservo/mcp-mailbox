@@ -121,6 +121,9 @@ export default {
   async fetch(request, env): Promise<Response> {
     // A stub that has thrown can be broken, so each call gets a new one.
     const store = retrying(() => env.MAILBOX.getByName("default") as unknown as Store);
-    return handle(request, store, { key: env.MAILBOX_KEY, openHooks: env.OPEN_HOOKS === "1" });
+    // The limiter counts per Cloudflare location and per address, the only thing known about an anonymous caller.
+    const limiter = env.HOOK_LIMITER;
+    const allowOpenHook = limiter && (async (req: Request) => (await limiter.limit({ key: req.headers.get("cf-connecting-ip") ?? "unknown" })).success);
+    return handle(request, store, { key: env.MAILBOX_KEY, openHooks: env.OPEN_HOOKS === "1", allowOpenHook });
   },
 } satisfies ExportedHandler<Env>;

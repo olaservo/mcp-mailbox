@@ -69,6 +69,8 @@ export interface MailboxOptions {
   /** Anyone may create a hook, up to `maxHooks`. Each hook's read key is the only way to read it. */
   openHooks?: boolean;
   maxHooks?: number;
+  /** Asked before a hook is created without the admin key. False answers 429. */
+  allowOpenHook?: (request: Request) => Promise<boolean>;
   now?: () => number;
 }
 
@@ -234,6 +236,9 @@ export async function handle(request: Request, store: Store, opts: MailboxOption
     switch (route) {
       case "POST /hooks": {
         if (!admin && !opts.openHooks) return unauthorized();
+        if (!admin && opts.allowOpenHook && !(await opts.allowOpenHook(request))) {
+          return Response.json({ error: "too many hooks created from here; try again in a minute" }, { status: 429, headers: { "retry-after": "60" } });
+        }
         const input = (await request.json().catch(() => ({}))) as { label?: unknown; idleSeconds?: unknown } | null;
         const label = typeof input?.label === "string" ? input.label.slice(0, 200) : "";
         const asked = input?.idleSeconds;

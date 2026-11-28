@@ -17,7 +17,9 @@
       "durable_objects": {
         "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
       },
-      "vars": { "OPEN_HOOKS": "1" }
+      "vars": { "OPEN_HOOKS": "1" },
+      // Hooks created without the admin key, per address. namespace_id is unique within the account.
+      "ratelimits": [{ "name": "HOOK_LIMITER", "namespace_id": "3415", "simple": { "limit": 10, "period": 60 } }]
     }
   }
 }
