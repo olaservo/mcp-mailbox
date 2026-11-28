@@ -1,18 +1,26 @@
 {
-  "name": "mcp-mailbox",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@olaservo/mcp-mailbox",
+  "version": "0.1.0",
   "type": "module",
-  "description": "A mailbox for MCP Events webhook delivery (SEP-3415)",
+  "description": "A mailbox for MCP Events webhook delivery (SEP-3415), and a reader that fetches and verifies events from it",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olaservo/mcp-mailbox.git"
+  },
+  "keywords": ["mcp", "model-context-protocol", "webhooks", "events"],
+  "bin": {
+    "mcp-mailbox-reader": "dist/reader/cli.js"
+  },
+  "files": ["dist"],
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 \"test/*.test.ts\"",
-    "types": "wrangler types",
     "typecheck": "wrangler types && tsc -p tsconfig.json && tsc -p tsconfig.node.json",
-    "reader": "node src/reader/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

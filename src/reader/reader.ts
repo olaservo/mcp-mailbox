@@ -72,6 +72,8 @@ interface State {
 }
 
 const PROTOCOL_VERSION = "2026-07-28";
+/** The package version, from `src/reader/` and from `dist/reader/` alike. */
+const VERSION = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
 /** DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, for the experiment in forge-mcp-server issue 9. SEP-3415 does not define it. */
 const SCHEME = "hpke-x25519-sha256-aes128gcm";
 const AES_128_GCM = 1;
@@ -443,7 +445,7 @@ export class Reader {
     const name = params.name === undefined || /^[\x20-\x7e]*$/.test(params.name) ? params.name : `=?base64?${Buffer.from(params.name).toString("base64")}?=`;
     const meta = {
       "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
-      "io.modelcontextprotocol/clientInfo": { name: "mcp-mailbox-reader", version: "0.0.0" },
+      "io.modelcontextprotocol/clientInfo": { name: "mcp-mailbox-reader", version: VERSION },
       "io.modelcontextprotocol/clientCapabilities": {},
     };
     const res = await fetch(url, {

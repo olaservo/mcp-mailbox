@@ -50,21 +50,21 @@ Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
 | `DELETE /hooks/<token>` | reader | Removes a path and its deliveries. Later POSTs to it get 404. |
 | `GET /.well-known/mcp-webhook-receiver.json` | MCP server | `{"receivers": ["/hooks/"]}`, so a server that supports SEP-3415's well-known option skips the challenge. No key. |
 | `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held in all, or 2,000 for this path. |
-| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `wait` (up to 25) holds the request until one arrives. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. |
+| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `limit` defaults to 100, up to 500. `wait` holds the request until one arrives, up to 25 seconds, and a larger value is taken as 25. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. |
 | `POST /ack` with `{"upTo": <seq>, "hook": <token>}` | reader | Deletes deliveries up to `seq`, for one callback path when `hook` is given. |
 
-Deliveries not acked are dropped after 7 days.
+Deliveries not acked for 7 days are dropped at the next delivery.
 
 When the store throws, the route answers 503 with `retry-after: 1` and the reason is logged. Reader routes also give the reason in `error`. The Worker first makes a read or an ack once more, on a new stub, when the Durable Object's error is marked `retryable` and not `overloaded`. A stored delivery and a hook change are made once.
 
 ## Reader
 
-The reader is not published to npm. Run it from a clone.
-
 ```bash
-node --env-file=<file> src/reader/cli.ts            # run until stopped
-node --env-file=<file> src/reader/cli.ts unsubscribe  # unsubscribe and remove the hook
+npx @olaservo/mcp-mailbox --env-file=<file>              # run until stopped
+npx @olaservo/mcp-mailbox --env-file=<file> unsubscribe  # unsubscribe and remove the hook
 ```
+
+Installed with `npm install -g @olaservo/mcp-mailbox`, the command is `mcp-mailbox-reader`. From a clone, run `node src/reader/cli.ts` with the same arguments. The variables can also come from the environment.
 
 | Variable | What |
 |---|---|
@@ -88,7 +88,7 @@ What it does:
 - Skips a delivery, with a log line, when:
   - the signature does not verify;
   - the timestamp is more than 5 minutes from `receivedAt`;
-  - `receivedAt` is over 8 days old or in the future;
+  - `receivedAt` is over 8 days old or more than 5 minutes in the future;
   - it does not hold the subscription id;
   - the event name is not the subscription's (the subscription id header is not signed, the name is);
   - it has handled the delivery before.
@@ -147,6 +147,7 @@ Node 24 or later. The tests run TypeScript directly with `node --test`.
 npm install
 npm test
 npm run typecheck
+npm run build      # the reader, to dist/
 ```
 
 `npm test` starts an in-memory mailbox. To run the same tests against the Worker, copy `.dev.vars.example` to `.dev.vars`, set a key, run `npx wrangler dev --port 8917`, and then:
@@ -155,7 +156,7 @@ npm run typecheck
 MAILBOX_URL=http://127.0.0.1:8917 MAILBOX_KEY=<the key> npm test
 ```
 
-Hooks the tests make on a remote mailbox have `idleSeconds` 3600, so the mailbox removes them an hour after their last fetch. Some tests ack without `hook`, which deletes every hook's deliveries up to that point. Do not run them against a mailbox a reader is using.
+Hooks the tests make on a remote mailbox have `idleSeconds` 3600, so the mailbox removes them an hour after their last fetch.
 
 `FORGE_MCP_SERVER=<path to a built forge-mcp-server>` adds a test that runs the reader against that server's HTTP endpoint and webhook hub, in the clear and encrypted. The encrypted run is skipped for a build without encryption.
 
@@ -166,12 +167,11 @@ npx wrangler deploy
 npx wrangler secret put MAILBOX_KEY
 ```
 
-The key is at least 32 characters. Reader routes answer 503 without it.
+The key is at least 32 characters. Reader routes answer 503 without it. A deploy can reach a running Durable Object up to 5 minutes late.
 
 ## Tested
 
 - The tests pass in memory, under `wrangler dev` and against the deployed Worker.
-- With forge-mcp-server through the deployed mailbox: endpoint verification by handshake and by the well-known document, and games from 2026-11-22, in the clear and encrypted. In the later games the reader handed on every event once, with no gaps in the event ids.
-- A Worker deploy reaches an active Durable Object up to 5 minutes late. Observed on 2026-11-23.
+- With forge-mcp-server through the deployed mailbox: endpoint verification by handshake and by the well-known document, and games in the clear and encrypted in which the reader handed on every event once, with no gaps in the event ids.
 
 Not tested: the 503 answer on the deployed Worker, two servers emitting at the same time, a server restart while it holds an event for a late client, the cursor against a subscription that lapsed, and what a held `wait` request costs in Durable Object duration.

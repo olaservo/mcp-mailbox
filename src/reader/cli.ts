@@ -1,10 +1,11 @@
+#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PollEndpoint } from "./poll-endpoint.ts";
 import { Reader, type Received } from "./reader.ts";
 
-const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
+const USAGE = `Usage: mcp-mailbox-reader [--env-file=<file>] [run|unsubscribe]
 
   MAILBOX_URL, MAILBOX_KEY   the mailbox and the reader's key
   READER_SERVER_URL          the MCP server's Streamable HTTP endpoint, such as https://host/mcp
@@ -23,11 +24,14 @@ const USAGE = `Usage: node --env-file=<file> src/reader/cli.ts [run|unsubscribe]
                              and the key pair.
   READER_LABEL               the hook's label in the mailbox`;
 
+const args = process.argv.slice(2);
+const envFile = args.find((arg) => arg.startsWith("--env-file="));
+if (envFile) process.loadEnvFile(envFile.slice("--env-file=".length));
 const env = process.env;
 const missing = ["MAILBOX_URL", "MAILBOX_KEY", "READER_EVENTS"].filter((name) => !env[name]);
 if (!env.READER_SERVER_URL && !env.READER_SERVERS_DIR) missing.push("READER_SERVER_URL or READER_SERVERS_DIR");
-const command = process.argv[2] ?? "run";
-if (missing.length > 0 || !["run", "unsubscribe"].includes(command)) {
+const command = args.find((arg) => !arg.startsWith("--")) ?? "run";
+if (missing.length > 0 || !["run", "unsubscribe"].includes(command) || args.some((arg) => arg.startsWith("--") && arg !== envFile)) {
   console.error(missing.length > 0 ? `Not set: ${missing.join(", ")}\n\n${USAGE}` : USAGE);
   process.exit(2);
 }
