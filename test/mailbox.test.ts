@@ -17,12 +17,14 @@ const unknownToken = "A".repeat(43);
 const post = (url: string, body: string | Buffer, headers: Record<string, string> = {}) => fetch(url, { method: "POST", headers, body });
 
 test("reader routes need the key", async () => {
-  for (const [method, path] of [["POST", "/hooks"], ["GET", "/hooks"], ["GET", "/deliveries"], ["POST", "/ack"], ["DELETE", `/hooks/${unknownToken}`]] as const) {
+  const { token } = await mailbox.createHook("keyed");
+  for (const [method, path] of [["POST", "/hooks"], ["GET", "/hooks"], ["GET", `/hooks/${token}`], ["GET", "/deliveries"], ["POST", "/ack"], ["DELETE", `/hooks/${token}`]] as const) {
     const none = await fetch(`${target.base}${path}`, { method });
     assert.equal(none.status, 401, `${method} ${path} without a key`);
     const wrong = await fetch(`${target.base}${path}`, { method, headers: { authorization: `Bearer ${"x".repeat(43)}` } });
     assert.equal(wrong.status, 401, `${method} ${path} with a wrong key`);
   }
+  await mailbox.deleteHook(token);
 });
 
 test("the well-known receiver document covers /hooks/ and needs no key", async () => {
@@ -212,12 +214,72 @@ test("fetch and ack can be limited to one hook", async () => {
   await mailbox.ack(left[0]!.seq, two.token);
 });
 
+test("a hook's read key reads, acks and deletes that hook and no other", async () => {
+  const mine = await mailbox.createHook("mine");
+  const other = await mailbox.createHook("other");
+  assert.match(mine.readKey, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(mine.readKey, mine.token);
+  const tip = await mailbox.tip();
+  await post(mine.url, "a");
+  await post(other.url, "b");
+  const asMine = reader(target, mine.readKey);
+
+  const got = await asMine.deliveries(tip, `&hook=${mine.token}`);
+  assert.deepEqual(got.map((d) => Buffer.from(d.body, "base64").toString()), ["a"]);
+  assert.equal(await asMine.status("GET", `/deliveries?after=${tip}`), 401, "without hook");
+  assert.equal(await asMine.status("GET", `/deliveries?after=${tip}&hook=${other.token}`), 401);
+  assert.equal(await asMine.status("GET", "/hooks"), 401);
+  assert.equal(await asMine.status("GET", `/hooks/${other.token}`), 401);
+  assert.equal(await asMine.status("POST", "/ack", { upTo: Number.MAX_SAFE_INTEGER, hook: other.token }), 401);
+  assert.equal(await asMine.status("DELETE", `/hooks/${other.token}`), 401);
+  assert.equal(await asMine.status("GET", `/hooks/${mine.token}`), 200);
+  const shown = (await (await fetch(`${target.base}/hooks/${mine.token}`, { headers: { authorization: `Bearer ${mine.readKey}` } })).json()) as Record<string, unknown>;
+  assert.equal(shown.token, mine.token);
+  assert.equal("readKeyHash" in shown, false);
+  const listed = (await (await fetch(`${target.base}/hooks`, { headers: { authorization: `Bearer ${target.key}` } })).json()) as { hooks: Record<string, unknown>[] };
+  assert.equal(listed.hooks.some((h) => "readKeyHash" in h), false);
+
+  assert.equal(await asMine.ack(got[0]!.seq, mine.token), 1);
+  assert.equal(await asMine.status("DELETE", `/hooks/${mine.token}`), 200);
+  assert.equal(await asMine.status("GET", `/hooks/${mine.token}`), 404, "a hook that is gone is not found, so the reader makes another");
+  assert.equal(await reader(target, "").status("GET", `/hooks/${other.token}`), 401, "without a key");
+  assert.equal((await mailbox.deliveries(tip, `&hook=${other.token}`)).length, 1, "the other hook is untouched");
+  await mailbox.deleteHook(other.token);
+});
+
+test("with open hooks anyone can create a hook, which expires, up to the cap that the admin key passes", async (t) => {
+  if (target.remote) return t.skip("needs open hooks and a small cap, set only on the in-memory mailbox");
+  const open = await startMailbox({ openHooks: true, maxHooks: 2 });
+  try {
+    const anyone = reader(open, "");
+    const first = await anyone.createHook("first");
+    assert.equal(first.idleSeconds, 7 * 24 * 3600, "a hook made without the admin key always expires");
+    assert.equal((await anyone.createHook("second", 60)).idleSeconds, 60);
+    assert.equal(await anyone.status("POST", "/hooks", {}), 503);
+    assert.equal((await reader(open).createHook("admin")).idleSeconds, undefined, "the admin key passes the cap");
+
+    assert.equal(await anyone.status("GET", "/hooks"), 401);
+    assert.equal(await anyone.status("GET", `/deliveries?hook=${first.token}`), 401);
+    assert.equal(await reader(open, first.readKey).status("GET", "/hooks"), 401);
+    await post(first.url, "x");
+    assert.equal((await reader(open, first.readKey).deliveries(0, `&hook=${first.token}`)).length, 1);
+  } finally {
+    await open.close();
+  }
+  const closed = await startMailbox({ key: null });
+  try {
+    assert.equal(await reader(closed, "").status("POST", "/hooks", {}), 503, "no admin key and no open hooks");
+  } finally {
+    await closed.close();
+  }
+});
+
 const failing = (err: Error) => {
   const opened = { count: 0 };
   const fail = async (): Promise<never> => {
     throw err;
   };
-  return { opened, open: () => (opened.count++, { createHook: fail, deleteHook: fail, hasHook: fail, listHooks: fail, insert: fail, list: fail, ack: fail }) };
+  return { opened, open: () => (opened.count++, { createHook: fail, deleteHook: fail, getHook: fail, listHooks: fail, insert: fail, list: fail, ack: fail }) };
 };
 
 test("a store that throws answers 503, and names the reason only to a caller with the key", async (t) => {
@@ -250,7 +312,7 @@ test("a read that fails with a retryable error is made once more on a new store"
 test("a write, an overloaded store and an error not marked retryable are not tried again", async () => {
   const write = failing(Object.assign(new Error("reset"), { retryable: true }));
   await assert.rejects(retrying(write.open, 0).insert(unknownToken, 0, {}, new Uint8Array()), /reset/);
-  await assert.rejects(retrying(write.open, 0).createHook(unknownToken, "", 0), /reset/);
+  await assert.rejects(retrying(write.open, 0).createHook(unknownToken, "", 0, undefined, ""), /reset/);
   await assert.rejects(retrying(write.open, 0).deleteHook(unknownToken), /reset/);
   assert.equal(write.opened.count, 3);
 

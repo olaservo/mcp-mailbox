@@ -7,7 +7,8 @@ import { Reader, type Received } from "./reader.ts";
 
 const USAGE = `Usage: mcp-mailbox-reader [--env-file=<file>] [run|unsubscribe]
 
-  MAILBOX_URL, MAILBOX_KEY   the mailbox and the reader's key
+  MAILBOX_URL                the mailbox
+  MAILBOX_KEY                its admin key. Not needed for a mailbox that lets anyone create a hook.
   READER_SERVER_URL          the MCP server's Streamable HTTP endpoint, such as https://host/mcp
   READER_SERVER_TOKEN        its bearer token
   READER_SERVERS_DIR         a directory where servers announce themselves, one *.json file each with
@@ -28,7 +29,7 @@ const args = process.argv.slice(2);
 const envFile = args.find((arg) => arg.startsWith("--env-file="));
 if (envFile) process.loadEnvFile(envFile.slice("--env-file=".length));
 const env = process.env;
-const missing = ["MAILBOX_URL", "MAILBOX_KEY", "READER_EVENTS"].filter((name) => !env[name]);
+const missing = ["MAILBOX_URL", "READER_EVENTS"].filter((name) => !env[name]);
 if (!env.READER_SERVER_URL && !env.READER_SERVERS_DIR) missing.push("READER_SERVER_URL or READER_SERVERS_DIR");
 const command = args.find((arg) => !arg.startsWith("--")) ?? "run";
 if (missing.length > 0 || !["run", "unsubscribe"].includes(command) || args.some((arg) => arg.startsWith("--") && arg !== envFile)) {
@@ -62,7 +63,7 @@ const events = env.READER_EVENTS!.split(",").map((name) => name.trim()).filter(B
 const endpoint = env.READER_POLL_PORT ? new PollEndpoint(events, (name) => reader.pending(name)) : undefined;
 
 const reader: Reader = new Reader({
-  mailbox: { url: env.MAILBOX_URL!, key: env.MAILBOX_KEY! },
+  mailbox: { url: env.MAILBOX_URL!, key: env.MAILBOX_KEY || undefined },
   server: env.READER_SERVER_URL ? { url: env.READER_SERVER_URL, token: env.READER_SERVER_TOKEN } : undefined,
   servers: env.READER_SERVERS_DIR ? { dir: env.READER_SERVERS_DIR, token: env.READER_SERVER_TOKEN } : undefined,
   events,

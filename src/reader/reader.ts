@@ -27,7 +27,8 @@ export interface Server {
 }
 
 export interface ReaderOptions {
-  mailbox: { url: string; key: string };
+  /** The mailbox, and its admin key. Without the key the mailbox has to allow anyone to create a hook. */
+  mailbox: { url: string; key?: string };
   /** An MCP server's Streamable HTTP endpoint, and its bearer token. */
   server?: Server;
   /**
@@ -62,7 +63,8 @@ interface State {
   secret: string;
   /** The X25519 key pair event data is encrypted to, as a JWK: `x` is the public key and `d` the private key. */
   key?: JsonWebKey;
-  hook?: { token: string; url: string };
+  /** `readKey` reads only this hook. A hook made by a mailbox from before read keys has none, and the admin key reads it. */
+  hook?: { token: string; url: string; readKey?: string };
   /** The highest mailbox sequence number handled. */
   after: number;
   /** Per server URL and event name: the subscription id it granted and the cursor it last returned. */
@@ -413,25 +415,27 @@ export class Reader {
   private async ensureHook(): Promise<{ token: string; url: string }> {
     const held = this.state.hook;
     if (held) {
-      const { hooks } = (await (await this.mailbox("GET", "/hooks")).json()) as { hooks: { token: string }[] };
-      if (hooks.some((h) => h.token === held.token)) return held;
+      if ((await this.mailbox("GET", `/hooks/${held.token}`, undefined, [404])).ok) return held;
       this.log("the mailbox no longer has the hook; creating another");
     }
-    const created = (await (await this.mailbox("POST", "/hooks", { label: this.opts.label ?? "reader", idleSeconds: this.opts.hookIdleSeconds })).json()) as { token: string; url: string };
-    this.state.hook = { token: created.token, url: created.url };
+    const created = (await (await this.mailbox("POST", "/hooks", { label: this.opts.label ?? "reader", idleSeconds: this.opts.hookIdleSeconds })).json()) as { token: string; url: string; readKey?: string };
+    this.state.hook = { token: created.token, url: created.url, ...(created.readKey ? { readKey: created.readKey } : {}) };
     for (const server of Object.values(this.state.servers)) server.subscriptions = {};
     this.save();
     return this.state.hook;
   }
 
-  private async mailbox(method: string, path: string, body?: unknown): Promise<Response> {
+  /** A request to the mailbox. It throws on an error status not in `allowed`. */
+  private async mailbox(method: string, path: string, body?: unknown, allowed: number[] = []): Promise<Response> {
+    // The hook's read key when there is one, so the admin key is sent only to create a hook.
+    const key = path === "/hooks" ? this.opts.mailbox.key : (this.state.hook?.readKey ?? this.opts.mailbox.key);
     const res = await fetch(`${this.opts.mailbox.url.replace(/\/$/, "")}${path}`, {
       method,
-      headers: { authorization: `Bearer ${this.opts.mailbox.key}` },
+      headers: key ? { authorization: `Bearer ${key}` } : {},
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: this.stopping,
     });
-    if (!res.ok) {
+    if (!res.ok && !allowed.includes(res.status)) {
       // The body names the reason: the mailbox's own `error`, or the platform's error page.
       const said = (await res.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 200);
       throw new Error(`mailbox ${method} ${path.split("?")[0]}: ${res.status}${said ? ` ${said}` : ""}`);

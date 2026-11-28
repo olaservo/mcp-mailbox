@@ -215,6 +215,42 @@ test("a restarted reader keeps its hook, secret and position", async () => {
   assert.deepEqual(second.ids(), ["ep-2"]);
 });
 
+test("a state file from before read keys keeps its hook and reads it with the admin key", async () => {
+  const { reader, options, ids, sub } = setUp(["a.moved"]);
+  await reader.subscribe();
+  const state = JSON.parse(readFileSync(options.stateFile, "utf8")) as { hook: { readKey?: string } };
+  assert.match(state.hook.readKey!, /^[A-Za-z0-9_-]{43}$/);
+  delete state.hook.readKey;
+  writeFileSync(options.stateFile, JSON.stringify(state));
+  const restarted = new Reader(options);
+  await restarted.subscribe();
+  assert.equal(restarted.hookUrl, reader.hookUrl);
+  await send(sub("a.moved"), "old-1", {});
+  assert.equal(await restarted.poll(), 1);
+  assert.deepEqual(ids(), ["old-1"]);
+});
+
+test("with no admin key the reader makes its hook on an open mailbox and keeps it across a restart", async (t) => {
+  if (target.remote) return t.skip("needs open hooks, set only on the in-memory mailbox");
+  const open = await startMailbox({ openHooks: true, key: null });
+  try {
+    const { reader, options, ids, sub } = setUp(["a.moved"], { mailbox: { url: open.base } });
+    await reader.subscribe();
+    assert.ok(reader.hookUrl!.startsWith(`${open.base}/hooks/`));
+    await send(sub("a.moved"), "open-1", {});
+    assert.equal(await reader.poll(), 1);
+    assert.deepEqual(ids(), ["open-1"]);
+    const restarted = new Reader(options);
+    await restarted.subscribe();
+    assert.equal(restarted.hookUrl, reader.hookUrl);
+    const url = reader.hookUrl!;
+    await restarted.unsubscribe();
+    assert.equal((await fetch(url, { method: "POST", body: "{}" })).status, 404, "unsubscribe removed the hook");
+  } finally {
+    await open.close();
+  }
+});
+
 test("a refresh sends back the cursor the server returned, also after a restart", async () => {
   const first = setUp(["a.moved"]);
   await first.reader.subscribe();

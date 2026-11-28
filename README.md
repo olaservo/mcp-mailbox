@@ -41,21 +41,29 @@ Where the SEP leaves a gap:
 
 ## API
 
-Reader routes take `Authorization: Bearer <MAILBOX_KEY>`.
+Reader routes take `Authorization: Bearer <key>`, where the key is one of two kinds:
+
+- The admin key, `MAILBOX_KEY`, works on every route and every hook.
+- A hook's read key, returned once when the hook is created, works only on that hook: `GET` and `DELETE /hooks/<token>`, and `/deliveries` and `/ack` with `hook=<token>`. The mailbox stores only its SHA-256.
+
+The token in a hook's URL is not a key, because every server the reader subscribes to sees it. A route for a hook that is gone answers 404 to any key, so a reader can tell that from a wrong key.
+
+With `OPEN_HOOKS=1` anyone can create a hook without a key, up to 1,000 hooks. Such a hook always expires, after 7 days without a fetch unless it asks for less. The admin key passes the cap and can create a hook that is kept.
 
 | Route | Who | What |
 |---|---|---|
-| `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, label}`, and `idleSeconds` when given. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. |
-| `GET /hooks` | reader | Lists callback paths with `createdAt`, `lastReadAt` and `idleSeconds`. |
+| `POST /hooks` with optional `{"label", "idleSeconds"}` | reader | Creates a callback path. Returns `{token, url, readKey, label}`, and `idleSeconds` when set. Use `url` as `delivery.url` in `events/subscribe`. With `idleSeconds` (60 to 604800), a path not fetched with `hook=<token>` for that long is removed with its deliveries. Without it the path is kept. Needs the admin key unless `OPEN_HOOKS` is on. 503 at the cap. |
+| `GET /hooks` | reader | Lists callback paths with `createdAt`, `lastReadAt` and `idleSeconds`. Admin key only. |
+| `GET /hooks/<token>` | reader | One path, in the same form. |
 | `DELETE /hooks/<token>` | reader | Removes a path and its deliveries. Later POSTs to it get 404. |
 | `GET /.well-known/mcp-webhook-receiver.json` | MCP server | `{"receivers": ["/hooks/"]}`, so a server that supports SEP-3415's well-known option skips the challenge. No key. |
 | `POST /hooks/<token>` | MCP server | A verification envelope is echoed. Anything else is stored. 404 for an unknown path, 413 over 256 KiB, 503 when 10,000 deliveries are held in all, or 2,000 for this path. |
-| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `limit` defaults to 100, up to 500. `wait` holds the request until one arrives, up to 25 seconds, and a larger value is taken as 25. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. |
-| `POST /ack` with `{"upTo": <seq>, "hook": <token>}` | reader | Deletes deliveries up to `seq`, for one callback path when `hook` is given. |
+| `GET /deliveries?after=<seq>&limit=<n>&wait=<seconds>&hook=<token>` | reader | Deliveries after `seq`, oldest first, as `{seq, hook, receivedAt, headers, body}` with `body` in base64. `limit` defaults to 100, up to 500. `wait` holds the request until one arrives, up to 25 seconds, and a larger value is taken as 25. `hook` limits the answer to one callback path, and a waiting fetch with `hook` returns only for that path's deliveries. A read key needs `hook`. |
+| `POST /ack` with `{"upTo": <seq>, "hook": <token>}` | reader | Deletes deliveries up to `seq`, for one callback path when `hook` is given. A read key needs `hook`. |
 
 Deliveries not acked for 7 days are dropped at the next delivery.
 
-When the store throws, the route answers 503 with `retry-after: 1` and the reason is logged. Reader routes also give the reason in `error`. The Worker first makes a read or an ack once more, on a new stub, when the Durable Object's error is marked `retryable` and not `overloaded`. A stored delivery and a hook change are made once.
+When the store throws, the route answers 503 with `retry-after: 1` and the reason is logged. A caller with the admin key also gets the reason in `error`. The Worker first makes a read or an ack once more, on a new stub, when the Durable Object's error is marked `retryable` and not `overloaded`. A stored delivery and a hook change are made once.
 
 ## Reader
 
@@ -68,7 +76,8 @@ Installed with `npm install -g @olaservo/mcp-mailbox`, the command is `mcp-mailb
 
 | Variable | What |
 |---|---|
-| `MAILBOX_URL`, `MAILBOX_KEY` | The mailbox and the reader's key. |
+| `MAILBOX_URL` | The mailbox. |
+| `MAILBOX_KEY` | Its admin key, used only to create the hook. Not needed for a mailbox with `OPEN_HOOKS` on. |
 | `READER_SERVER_URL` | The MCP server's Streamable HTTP endpoint, such as `https://host/mcp`. |
 | `READER_SERVER_TOKEN` | Its bearer token. For forge-mcp-server this is `FORGE_MCP_TOKEN`. |
 | `READER_SERVERS_DIR` | A directory where servers announce themselves. Takes the place of `READER_SERVER_URL`, or adds to it. See below. |
@@ -81,7 +90,7 @@ Installed with `npm install -g @olaservo/mcp-mailbox`, the command is `mcp-mailb
 
 What it does:
 
-- Creates one hook in the mailbox and a `whsec_` secret on first run, and keeps both in the state file.
+- Creates one hook in the mailbox and a `whsec_` secret on first run, and keeps both in the state file with the hook's read key. It reads with the read key after that. A state file from before read keys has none, and the reader goes on with the admin key.
 - Sends `events/subscribe` for each event as a single 2026-07-28 request with no session. It repeats this every minute, or at half the granted lifetime when that is sooner. The repeat is the refresh, and it restores a subscription the server lost in a restart.
 - Keeps the cursor each `events/subscribe` returns and sends it with the next one, so a server that replays from a cursor resends what a lapsed subscription missed. A repeat is dropped by the check below.
 - Fetches with `wait=25` and `hook=<its token>`, so several readers can share one mailbox. After a fetch returns deliveries it fetches again 500 ms later, so events POSTed together are ordered together.
@@ -167,7 +176,9 @@ npx wrangler deploy
 npx wrangler secret put MAILBOX_KEY
 ```
 
-The key is at least 32 characters. Reader routes answer 503 without it. A deploy can reach a running Durable Object up to 5 minutes late.
+The key is at least 32 characters. Without it and without `OPEN_HOOKS`, `POST /hooks` answers 503. A deploy can reach a running Durable Object up to 5 minutes late.
+
+`npx wrangler deploy --env demo` deploys a second Worker, `mcp-mailbox-demo`, with `OPEN_HOOKS=1` and its own Durable Object. It needs no `MAILBOX_KEY`. One set with `npx wrangler secret put MAILBOX_KEY --env demo` lets you list its hooks.
 
 ## Tested
 

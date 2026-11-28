@@ -7,6 +7,17 @@
   "durable_objects": {
     "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }],
   // MAILBOX_KEY is a secret: `npx wrangler secret put MAILBOX_KEY`. For `wrangler dev` it comes from .dev.vars.
+  "vars": { "OPEN_HOOKS": "0" },
+  "env": {
+    // A mailbox where anyone can create a hook: `npx wrangler deploy --env demo`.
+    "demo": {
+      "name": "mcp-mailbox-demo",
+      "durable_objects": {
+        "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
+      },
+      "vars": { "OPEN_HOOKS": "1" }
+    }
+  }
 }

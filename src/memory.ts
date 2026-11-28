@@ -1,8 +1,9 @@
-import { MAX_PER_HOOK, MAX_STORED, RETENTION_MS, Waiters, type Delivery, type Hook, type Store } from "./core.ts";
+import { MAX_PER_HOOK, MAX_STORED, RETENTION_MS, Waiters, type Delivery, type Hook, type Store, type StoredHook } from "./core.ts";
 
 /** A store that keeps everything in memory. Used by the tests. */
 export class MemoryStore implements Store {
   private readonly hooks = new Map<string, Hook>();
+  private readonly readKeyHashes = new Map<string, string>();
   private deliveries: Delivery[] = [];
   private seq = 0;
   private readonly waiters = new Waiters();
@@ -14,18 +15,24 @@ export class MemoryStore implements Store {
     this.maxPerHook = opts.maxPerHook ?? MAX_PER_HOOK;
   }
 
-  async createHook(token: string, label: string, now: number, idleSeconds?: number): Promise<void> {
+  async createHook(token: string, label: string, now: number, idleSeconds: number | undefined, readKeyHash: string, maxHooks?: number): Promise<boolean> {
     this.expire(now);
+    if (maxHooks !== undefined && this.hooks.size >= maxHooks) return false;
     this.hooks.set(token, { token, label, createdAt: now, lastReadAt: now, ...(idleSeconds !== undefined ? { idleSeconds } : {}) });
+    this.readKeyHashes.set(token, readKeyHash);
+    return true;
   }
 
   async deleteHook(token: string): Promise<boolean> {
     this.deliveries = this.deliveries.filter((d) => d.hook !== token);
+    this.readKeyHashes.delete(token);
     return this.hooks.delete(token);
   }
 
-  async hasHook(token: string): Promise<boolean> {
-    return this.hooks.has(token);
+  async getHook(token: string): Promise<StoredHook | undefined> {
+    const hook = this.hooks.get(token);
+    const readKeyHash = this.readKeyHashes.get(token);
+    return hook && { ...hook, ...(readKeyHash !== undefined ? { readKeyHash } : {}) };
   }
 
   async listHooks(): Promise<Hook[]> {

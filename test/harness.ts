@@ -13,12 +13,12 @@ export interface Target {
   close(): Promise<void>;
 }
 
-/** MAILBOX_URL and MAILBOX_KEY point the tests at a running mailbox. Without them, one starts here in memory. */
-export async function startMailbox(opts: { maxStored?: number; maxPerHook?: number; now?: () => number } = {}): Promise<Target> {
+/** MAILBOX_URL and MAILBOX_KEY point the tests at a running mailbox. Without them, one starts here in memory. `key: null` starts it with no admin key. */
+export async function startMailbox(opts: { maxStored?: number; maxPerHook?: number; now?: () => number; openHooks?: boolean; maxHooks?: number; key?: null } = {}): Promise<Target> {
   if (process.env.MAILBOX_URL) {
     return { base: process.env.MAILBOX_URL.replace(/\/$/, ""), key: process.env.MAILBOX_KEY ?? "", remote: true, close: async () => {} };
   }
-  const key = randomBytes(32).toString("base64url");
+  const key = opts.key === null ? "" : randomBytes(32).toString("base64url");
   const store = new MemoryStore(opts);
   const now = opts.now;
   const server = createServer((req, res) => {
@@ -31,7 +31,7 @@ export async function startMailbox(opts: { maxStored?: number; maxPerHook?: numb
       }
       const hasBody = req.method !== "GET" && req.method !== "HEAD";
       const request = new Request(`http://${req.headers.host}${req.url}`, { method: req.method, headers, body: hasBody ? Buffer.concat(chunks) : undefined });
-      const response = await handle(request, store, { key, now });
+      const response = await handle(request, store, { key, now, openHooks: opts.openHooks, maxHooks: opts.maxHooks });
       res.writeHead(response.status, Object.fromEntries(response.headers));
       res.end(Buffer.from(await response.arrayBuffer()));
     });
@@ -49,15 +49,17 @@ export async function startMailbox(opts: { maxStored?: number; maxPerHook?: numb
 /** Hooks made by a run against a remote mailbox are removed this long after their last fetch. */
 export const TEST_HOOK_IDLE_SECONDS = 3600;
 
-/** The reader's side of the mailbox API. */
-export function reader(target: Target) {
-  const auth = { authorization: `Bearer ${target.key}` };
+/** The reader's side of the mailbox API, with the admin key or with `key`. */
+export function reader(target: Target, key = target.key) {
+  const auth: Record<string, string> = key ? { authorization: `Bearer ${key}` } : {};
   return {
-    async createHook(label = "", idleSeconds = target.remote ? TEST_HOOK_IDLE_SECONDS : undefined): Promise<{ token: string; url: string }> {
+    async createHook(label = "", idleSeconds = target.remote ? TEST_HOOK_IDLE_SECONDS : undefined): Promise<{ token: string; url: string; readKey: string; idleSeconds?: number }> {
       const res = await fetch(`${target.base}/hooks`, { method: "POST", headers: auth, body: JSON.stringify({ label, idleSeconds }) });
       if (res.status !== 201) throw new Error(`create hook: ${res.status}`);
-      return (await res.json()) as { token: string; url: string };
+      return (await res.json()) as { token: string; url: string; readKey: string; idleSeconds?: number };
     },
+    /** A reader route's status, with this caller's key. */
+    status: async (method: string, path: string, body?: unknown) => (await fetch(`${target.base}${path}`, { method, headers: auth, body: body === undefined ? undefined : JSON.stringify(body) })).status,
     deleteHook: (token: string) => fetch(`${target.base}/hooks/${token}`, { method: "DELETE", headers: auth }),
     async deliveries(after: number, query = ""): Promise<Fetched[]> {
       const res = await fetch(`${target.base}/deliveries?after=${after}${query}`, { headers: auth });
