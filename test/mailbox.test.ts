@@ -59,7 +59,7 @@ test("a delivery comes back byte for byte with its headers, and ack removes it",
   assert.equal((await post(hook.url, first, headers)).status, 200);
   assert.equal((await post(hook.url, second, { ...headers, "webhook-id": "evt_2" })).status, 200);
 
-  const got = await mailbox.deliveries(tip);
+  const got = await mailbox.deliveries(tip, `&hook=${hook.token}`);
   assert.equal(got.length, 2);
   assert.deepEqual(Buffer.from(got[0]!.body, "base64"), first);
   assert.deepEqual(Buffer.from(got[1]!.body, "base64"), second);
@@ -69,35 +69,36 @@ test("a delivery comes back byte for byte with its headers, and ack removes it",
   assert.ok(got[1]!.seq > got[0]!.seq);
   assert.ok(Math.abs(got[0]!.receivedAt - sent) < 5000, "receivedAt is the arrival time");
 
-  assert.equal((await mailbox.deliveries(got[0]!.seq)).length, 1, "after skips what was read");
-  assert.equal((await mailbox.deliveries(tip, "&limit=1")).length, 1);
-  assert.ok((await mailbox.ack(got[1]!.seq)) >= 2);
-  assert.deepEqual(await mailbox.deliveries(0), []);
+  assert.equal((await mailbox.deliveries(got[0]!.seq, `&hook=${hook.token}`)).length, 1, "after skips what was read");
+  assert.equal((await mailbox.deliveries(tip, `&limit=1&hook=${hook.token}`)).length, 1);
+  assert.equal(await mailbox.ack(got[1]!.seq, hook.token), 2);
+  assert.deepEqual(await mailbox.deliveries(0, `&hook=${hook.token}`), []);
 });
 
 test("a body over 256 KiB is refused with 413", async () => {
   const hook = await mailbox.createHook("large");
   assert.equal((await post(hook.url, Buffer.alloc(256 * 1024 + 1, "a"))).status, 413);
   assert.equal((await post(hook.url, Buffer.alloc(256 * 1024, "a"))).status, 200);
-  await mailbox.ack(await mailbox.tip());
+  await mailbox.deleteHook(hook.token);
 });
 
 test("a waiting fetch returns when a delivery arrives", async () => {
   const hook = await mailbox.createHook("wait");
   const tip = await mailbox.tip();
   const started = Date.now();
-  const waiting = mailbox.deliveries(tip, "&wait=10");
+  const waiting = mailbox.deliveries(tip, `&wait=10&hook=${hook.token}`);
   setTimeout(() => void post(hook.url, '{"eventId":"late"}'), 300);
   const got = await waiting;
   assert.equal(got.length, 1);
   assert.ok(Date.now() - started < 5000, `returned after ${Date.now() - started} ms`);
-  await mailbox.ack(got[0]!.seq);
+  await mailbox.ack(got[0]!.seq, hook.token);
 });
 
 test("a waiting fetch returns empty when nothing arrives", async () => {
+  const hook = await mailbox.createHook("quiet");
   const tip = await mailbox.tip();
   const started = Date.now();
-  assert.deepEqual(await mailbox.deliveries(tip, "&wait=1"), []);
+  assert.deepEqual(await mailbox.deliveries(tip, `&wait=1&hook=${hook.token}`), []);
   assert.ok(Date.now() - started >= 900);
 });
 
@@ -205,10 +206,10 @@ test("fetch and ack can be limited to one hook", async () => {
   const mine = await mailbox.deliveries(tip, `&hook=${one.token}`);
   assert.deepEqual(mine.map((d) => Buffer.from(d.body, "base64").toString()), ["a", "c"]);
   assert.equal(await mailbox.ack(mine.at(-1)!.seq, one.token), 2);
-  const left = await mailbox.deliveries(tip);
+  const left = (await mailbox.deliveries(tip)).filter((d) => d.hook === one.token || d.hook === two.token);
   assert.deepEqual(left.map((d) => d.hook), [two.token]);
   assert.equal((await fetch(`${target.base}/deliveries?hook=short`, { headers: { authorization: `Bearer ${target.key}` } })).status, 400);
-  await mailbox.ack(left[0]!.seq);
+  await mailbox.ack(left[0]!.seq, two.token);
 });
 
 const failing = (err: Error) => {

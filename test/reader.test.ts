@@ -13,6 +13,7 @@ import { reader as mailboxClient, startMailbox, TEST_HOOK_IDLE_SECONDS, type Tar
 
 let target: Target;
 let server: Awaited<ReturnType<typeof fakeServer>>;
+const tempRoot = mkdtempSync(join(tmpdir(), "mcp-mailbox-test-"));
 
 before(async () => {
   target = await startMailbox();
@@ -21,6 +22,7 @@ before(async () => {
 after(async () => {
   await server.close();
   await target.close();
+  rmSync(tempRoot, { recursive: true, force: true });
 });
 
 interface Subscribed {
@@ -123,7 +125,7 @@ function setUp(events: string[], extra: Partial<ReaderOptions> = {}, from = serv
     mailbox: { url: target.base, key: target.key },
     server: { url: from.url, token: "s3cret" },
     events,
-    stateFile: join(mkdtempSync(join(tmpdir(), "reader-")), "state.json"),
+    stateFile: join(mkdtempSync(join(tempRoot, "reader-")), "state.json"),
     settleMs: 50,
     hookIdleSeconds: TEST_HOOK_IDLE_SECONDS,
     handle: (received) => void got.push(received),
@@ -369,7 +371,7 @@ test("a polling client gets the reader's events from the poll endpoint", async (
 
 test("servers in the directory are each subscribed, with the token from the file", async () => {
   const other = await fakeServer();
-  const dir = mkdtempSync(join(tmpdir(), "servers-"));
+  const dir = mkdtempSync(join(tempRoot, "servers-"));
   // The first file names the server the reader already has.
   writeFileSync(join(dir, "1.json"), JSON.stringify({ url: server.url }));
   writeFileSync(join(dir, "2.json"), JSON.stringify({ url: other.url, token: "t2" }));
@@ -402,7 +404,7 @@ test("servers in the directory are each subscribed, with the token from the file
 
 test("run subscribes to a server that appears in the directory, and goes on when one is down", async () => {
   const other = await fakeServer();
-  const dir = join(mkdtempSync(join(tmpdir(), "servers-")), "not-yet");
+  const dir = join(mkdtempSync(join(tempRoot, "servers-")), "not-yet");
   const { reader, ids, lines } = setUp(["a.moved"], { server: undefined, servers: { dir }, scanMs: 50, waitSeconds: 1 });
   const stop = new AbortController();
   const running = reader.run(stop.signal);

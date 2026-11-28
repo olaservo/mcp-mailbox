@@ -10,12 +10,12 @@ export interface Fetched {
 }
 
 /** Standard Webhooks allows a timestamp this far from the time of receipt. */
-export const TOLERANCE_MS = 5 * 60 * 1000;
+const TOLERANCE_MS = 5 * 60 * 1000;
 /** The mailbox drops a delivery after 7 days. One older than this by the reader's clock is refused. */
 export const MAX_HELD_MS = 8 * 24 * 60 * 60 * 1000;
 
 /** Standard Webhooks `v1`: HMAC-SHA256 over `<id>.<timestamp>.<body>`, with the body as received. */
-export function signatureOk(secret: string, delivery: Fetched): boolean {
+function signatureOk(secret: string, delivery: Fetched): boolean {
   const key = Buffer.from(secret.slice(6), "base64");
   const signed = `${delivery.headers["webhook-id"]}.${delivery.headers["webhook-timestamp"]}.`;
   const expected = createHmac("sha256", key).update(signed).update(Buffer.from(delivery.body, "base64")).digest();

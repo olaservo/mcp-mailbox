@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { Reader, type Received } from "../src/reader/reader.ts";
 import { reader as mailboxClient, startMailbox, TEST_HOOK_IDLE_SECONDS } from "./harness.ts";
@@ -10,6 +10,8 @@ import { reader as mailboxClient, startMailbox, TEST_HOOK_IDLE_SECONDS } from ".
 // Runs the reader against forge-mcp-server's HTTP endpoint and webhook hub. Set FORGE_MCP_SERVER to a built clone.
 const repo = process.env.FORGE_MCP_SERVER;
 const skip = repo ? false : "FORGE_MCP_SERVER is not set";
+const tempRoot = mkdtempSync(join(tmpdir(), "mcp-mailbox-test-"));
+after(() => rmSync(tempRoot, { recursive: true, force: true }));
 const load = (file: string) => import(pathToFileURL(join(repo!, "dist", file)).href);
 
 for (const encrypt of [false, true]) {
@@ -29,7 +31,7 @@ for (const encrypt of [false, true]) {
       server: { url: `http://127.0.0.1:${server.port()}/mcp`, token: "s3cret-for-the-reader" },
       events: ["forge.your_move", "forge.chat"],
       encrypt,
-      stateFile: join(mkdtempSync(join(tmpdir(), "reader-forge-")), "state.json"),
+      stateFile: join(mkdtempSync(join(tempRoot, "reader-forge-")), "state.json"),
       label: "forge test",
       hookIdleSeconds: TEST_HOOK_IDLE_SECONDS,
       handle: (received) => void got.push(received),

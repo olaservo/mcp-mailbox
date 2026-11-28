@@ -5,7 +5,7 @@
  * when each delivery arrived, and the reader verifies against that time and deduplicates.
  */
 
-export const MAX_BODY_BYTES = 256 * 1024;
+const MAX_BODY_BYTES = 256 * 1024;
 export const MAX_STORED = 10_000;
 export const MAX_PER_HOOK = 2_000;
 export const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;

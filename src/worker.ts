@@ -11,7 +11,7 @@ export class Mailbox extends DurableObject<Env> implements Store {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS hooks (token TEXT PRIMARY KEY, label TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS hooks (token TEXT PRIMARY KEY, label TEXT NOT NULL, created_at INTEGER NOT NULL, last_read_at INTEGER, idle_seconds INTEGER);
       CREATE TABLE IF NOT EXISTS deliveries (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         hook TEXT NOT NULL,
@@ -21,12 +21,6 @@ export class Mailbox extends DurableObject<Env> implements Store {
       );
       CREATE INDEX IF NOT EXISTS deliveries_hook ON deliveries (hook, seq);
     `);
-    // Hooks from before expiry have neither column. A null idle_seconds is never expired.
-    for (const column of ["last_read_at INTEGER", "idle_seconds INTEGER"]) {
-      try {
-        ctx.storage.sql.exec(`ALTER TABLE hooks ADD COLUMN ${column}`);
-      } catch {}
-    }
   }
 
   async createHook(token: string, label: string, now: number, idleSeconds?: number): Promise<void> {
@@ -113,7 +107,7 @@ export class Mailbox extends DurableObject<Env> implements Store {
   /** Removes hooks not fetched within their `idle_seconds`, with their deliveries. */
   private expire(now: number): void {
     const sql = this.ctx.storage.sql;
-    const idle = "SELECT token FROM hooks WHERE idle_seconds IS NOT NULL AND COALESCE(last_read_at, created_at) < ? - idle_seconds * 1000";
+    const idle = "SELECT token FROM hooks WHERE idle_seconds IS NOT NULL AND last_read_at < ? - idle_seconds * 1000";
     sql.exec(`DELETE FROM deliveries WHERE hook IN (${idle})`, now);
     sql.exec(`DELETE FROM hooks WHERE token IN (${idle})`, now);
   }

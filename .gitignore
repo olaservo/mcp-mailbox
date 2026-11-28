@@ -2,8 +2,5 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
-*.db
-*.db-wal
-*.db-shm
 .env
 worker-configuration.d.ts

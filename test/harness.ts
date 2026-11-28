@@ -49,8 +49,6 @@ export async function startMailbox(opts: { maxStored?: number; maxPerHook?: numb
 /** Hooks made by a run against a remote mailbox are removed this long after their last fetch. */
 export const TEST_HOOK_IDLE_SECONDS = 3600;
 
-export type { Fetched };
-
 /** The reader's side of the mailbox API. */
 export function reader(target: Target) {
   const auth = { authorization: `Bearer ${target.key}` };

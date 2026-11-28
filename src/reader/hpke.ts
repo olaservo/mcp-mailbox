@@ -1,7 +1,8 @@
 import { createCipheriv, createDecipheriv, createHmac, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, type CipherGCMTypes, type KeyObject } from "node:crypto";
 
 // RFC 9180 base mode with DHKEM(X25519, HKDF-SHA256) and HKDF-SHA256, from Node built-ins.
-// `test/hpke-vectors.json` holds the CFRG test vectors it is checked against.
+// `test/hpke-vectors.json` holds the CFRG test vectors it is checked against. The reader uses only AES-128-GCM and the
+// receiver half. The other AEADs and the sender half are here for the vectors and the tests.
 
 /** RFC 9180 AEAD ids: AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305. */
 export type AeadId = 1 | 2 | 3;
@@ -43,11 +44,11 @@ const KEM_SUITE = cat(Buffer.from("KEM"), i2osp(KEM_ID, 2));
 const PKCS8 = Buffer.from("302e020100300506032b656e04220420", "hex");
 const SPKI = Buffer.from("302a300506032b656e032100", "hex");
 export const privFromRaw = (sk: Buffer) => createPrivateKey({ key: cat(PKCS8, sk), format: "der", type: "pkcs8" });
-export function pubFromRaw(pk: Buffer): KeyObject {
+function pubFromRaw(pk: Buffer): KeyObject {
   if (pk.length !== 32) throw new Error("an X25519 public key is 32 bytes");
   return createPublicKey({ key: cat(SPKI, pk), format: "der", type: "spki" });
 }
-export const rawPub = (key: KeyObject) => createPublicKey(key).export({ format: "der", type: "spki" }).subarray(SPKI.length);
+const rawPub = (key: KeyObject) => createPublicKey(key).export({ format: "der", type: "spki" }).subarray(SPKI.length);
 
 function sharedSecret(dh: Buffer, enc: Buffer, pkR: Buffer): Buffer {
   const prk = labeledExtract(KEM_SUITE, EMPTY, "eae_prk", dh);
