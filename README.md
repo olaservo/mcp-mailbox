@@ -67,25 +67,32 @@ When the store throws, the route answers 503 with `retry-after: 1` and the reaso
 
 ## Reader
 
+An env file names the mailbox, the server and the events:
+
+```bash
+MAILBOX_URL=https://<your mailbox>
+MAILBOX_KEY=<the mailbox's admin key>
+READER_SERVER_URL=https://<host>/mcp
+READER_SERVER_TOKEN=<the server's bearer token>
+READER_EVENTS=forge.your_move,forge.chat
+```
+
 ```bash
 npx @olaservo/mcp-mailbox --env-file=<file>              # run until stopped
 npx @olaservo/mcp-mailbox --env-file=<file> unsubscribe  # unsubscribe and remove the hook
 ```
 
-Installed with `npm install -g @olaservo/mcp-mailbox`, the command is `mcp-mailbox-reader`. From a clone, run `node src/reader/cli.ts` with the same arguments. The variables can also come from the environment.
+Each event is printed as one JSON line on stdout. `MAILBOX_KEY` is only needed to create the hook, and a mailbox with `OPEN_HOOKS` on does not need it. The variables can also come from the environment. Installed with `npm install -g @olaservo/mcp-mailbox`, the command is `mcp-mailbox-reader`. From a clone, it is `node src/reader/cli.ts`.
+
+Other options:
 
 | Variable | What |
 |---|---|
-| `MAILBOX_URL` | The mailbox. |
-| `MAILBOX_KEY` | Its admin key, used only to create the hook. Not needed for a mailbox with `OPEN_HOOKS` on. |
-| `READER_SERVER_URL` | The MCP server's Streamable HTTP endpoint, such as `https://host/mcp`. |
-| `READER_SERVER_TOKEN` | Its bearer token. For forge-mcp-server this is `FORGE_MCP_TOKEN`. |
-| `READER_SERVERS_DIR` | A directory where servers announce themselves. Takes the place of `READER_SERVER_URL`, or adds to it. See below. |
-| `READER_EVENTS` | Event names, comma separated, such as `forge.your_move,forge.chat`. |
-| `READER_EXEC` | A command run once per event through the shell, with the event as JSON on stdin and `MCP_EVENT_NAME`, `MCP_EVENT_ID` and `MCP_SUBSCRIPTION_ID` set. Without it, each event is one JSON line on stdout. |
-| `READER_POLL_PORT` | Serves the events as MCP Events poll delivery on `127.0.0.1:<port>`. Takes the place of `READER_EXEC`. See below. |
-| `READER_ENCRYPT` | `1` asks each server to encrypt event data to the reader's key. Off by default. See below. |
-| `READER_STATE` | State file, default `~/.mcp-mailbox/reader-state.json`. It holds the signing secret and, with `READER_ENCRYPT`, the key pair. |
+| `READER_POLL_PORT` | Serve the events to a client that polls, on `127.0.0.1:<port>`, in place of stdout and `READER_EXEC`. See [Poll endpoint](#poll-endpoint). |
+| `READER_EXEC` | Run a command once per event, with the event as JSON on stdin and `MCP_EVENT_NAME`, `MCP_EVENT_ID` and `MCP_SUBSCRIPTION_ID` set. |
+| `READER_SERVERS_DIR` | Subscribe to every server that announces itself in this directory. See [Several servers](#several-servers). |
+| `READER_ENCRYPT` | `1` to have servers encrypt event data so the mailbox cannot read it. See [Encryption](#encryption). |
+| `READER_STATE` | The state file, default `~/.mcp-mailbox/reader-state.json`. It holds the signing secret, the hook's read key and the encryption key pair. |
 | `READER_LABEL` | The hook's label in the mailbox. |
 
 What it does:
